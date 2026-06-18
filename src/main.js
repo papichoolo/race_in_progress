@@ -3291,12 +3291,16 @@ function pollGamepad() {
     const y = pad.buttons[ 3 ] && pad.buttons[ 3 ].pressed; // camera toggle
     const back = pad.buttons[ 8 ] && pad.buttons[ 8 ].pressed; // Back / Select / Share — cycle car
     const start = pad.buttons[ 9 ] && pad.buttons[ 9 ].pressed; // reset
+    const dUp = pad.buttons[ 12 ] && pad.buttons[ 12 ].pressed; // D-pad up — stats for nerds
+    const dLeft = pad.buttons[ 14 ] && pad.buttons[ 14 ].pressed; // D-pad left — minimap
 
     if ( rb && ! prev[ 5 ] && transmission.mode === 'manual' ) manualShift( 1 );
     if ( lb && ! prev[ 4 ] && transmission.mode === 'manual' ) manualShift( - 1 );
     if ( x && ! prev[ 2 ] ) toggleTransmissionMode();
     if ( y && ! prev[ 3 ] ) cycleCameraMode();
     if ( back && ! prev[ 8 ] ) cycleCar( 1 );
+    if ( dUp && ! prev[ 12 ] ) toggleStatsForNerds();
+    if ( dLeft && ! prev[ 14 ] ) toggleMinimap();
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
 
     gamepad.prevButtons = pad.buttons.map( b => b.pressed );
