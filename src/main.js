@@ -1203,13 +1203,26 @@ function initVolumeSlider() {
 
 async function startAudio() {
 
-    if ( audio.started ) return;
+    // Already initialized — just make sure the context is running. Browsers
+    // can leave/return AudioContext to 'suspended' even after a successful
+    // create (Safari especially), so re-call resume() on every gesture.
+    if ( audio.started ) {
+
+        if ( audio.ctx && audio.ctx.state === 'suspended' ) {
+
+            audio.ctx.resume().catch( () => {} );
+
+        }
+        return;
+
+    }
     audio.started = true;
 
     const Ctx = window.AudioContext || window.webkitAudioContext;
-    if ( ! Ctx ) return;
+    if ( ! Ctx ) { audio.started = false; return; }
     const ctx = new Ctx();
     audio.ctx = ctx;
+    if ( ctx.state === 'suspended' ) ctx.resume().catch( () => {} );
 
     audio.masterGain = ctx.createGain();
     audio.masterGain.gain.value = audio.masterVolume;
@@ -1729,11 +1742,15 @@ async function init() {
     _positionStatsBelowInfo();
     window.addEventListener( 'resize', _positionStatsBelowInfo );
 
-    // First user gesture unlocks the AudioContext on every browser.
+    // Audio cannot autoplay without a user gesture — browsers block it. We
+    // listen broadly so *any* interaction (key, click, tap, scroll, focus)
+    // unlocks the AudioContext without forcing the user to find the slider.
+    // startAudio() is idempotent and also re-resumes a suspended context, so
+    // we don't use { once: true }.
     const unlockAudio = () => { startAudio(); };
-    window.addEventListener( 'keydown', unlockAudio, { once: true } );
-    window.addEventListener( 'pointerdown', unlockAudio, { once: true } );
-    window.addEventListener( 'touchstart', unlockAudio, { once: true } );
+    const unlockEvents = [ 'keydown', 'pointerdown', 'mousedown', 'click', 'touchstart', 'wheel' ];
+    for ( const ev of unlockEvents ) window.addEventListener( ev, unlockAudio, { passive: true } );
+    window.addEventListener( 'focus', unlockAudio );
 
     window.addEventListener( 'keydown', ( event ) => {
 
@@ -3328,6 +3345,19 @@ function pollGamepad() {
     if ( dUp && ! prev[ 12 ] ) toggleStatsForNerds();
     if ( dLeft && ! prev[ 14 ] ) toggleMinimap();
     if ( start && ! prev[ 9 ] ) input.keyR = true; else if ( ! start && prev[ 9 ] ) input.keyR = false;
+
+    // Any gamepad button press counts as a user gesture in modern browsers,
+    // so we can also unlock audio from here — handy for players who jump
+    // straight into driving with a controller and never touch the keyboard.
+    if ( ! audio.started ) {
+
+        for ( let i = 0; i < pad.buttons.length; i ++ ) {
+
+            if ( pad.buttons[ i ] && pad.buttons[ i ].pressed ) { startAudio(); break; }
+
+        }
+
+    }
 
     gamepad.prevButtons = pad.buttons.map( b => b.pressed );
 
