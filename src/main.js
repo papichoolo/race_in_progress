@@ -263,6 +263,9 @@ function applyCarConfig( car, skipVisuals ) {
     // for F1, flat-bottomed rim, etc.).
     if ( ! skipVisuals ) buildAndMountSteeringWheel( car );
 
+    // Re-bake the per-car toe into the wheel steering channel.
+    applySuspensionGeometry();
+
     // Engine sound.
     swapEngineAudio( car );
 
@@ -284,6 +287,9 @@ function cycleCar( direction ) {
     currentCarIndex = ( currentCarIndex + direction + CARS.length ) % CARS.length;
     applyCarConfig( CARS[ currentCarIndex ] );
     showCarToast( CARS[ currentCarIndex ].name );
+    resetTires();         // fresh tires on each car
+    resetDrivetrain();    // engine starts at the new car's idle, clutch closed
+    clearSkidMarks();
 
 }
 
@@ -327,6 +333,620 @@ function showCarToast( name ) {
     carToastEl.style.opacity = '1';
     if ( _carToastTimer ) clearTimeout( _carToastTimer );
     _carToastTimer = setTimeout( () => { carToastEl.style.opacity = '0'; }, 1400 );
+
+}
+
+// ---------------- camber + toe (suspension geometry) ----------------
+// Rapier's vehicle controller can't tilt wheel axles out of the suspension
+// plane, so we approximate camber's effect on lateral grip by modulating
+// setWheelSideFrictionStiffness with corner load. Toe is baked into the
+// per-wheel steering offset (front wheels get base toe + driver steering on top).
+
+const _DEG = Math.PI / 180;
+const CAMBER_GRIP_PER_DEG = 0.06;     // +6 % lat grip per |°| of camber at reference load
+const CAMBER_STRAIGHT_COST = 0.30;    // straight-line penalty coefficient
+
+function applySuspensionGeometry() {
+
+    if ( ! vehicleController || ! currentCar ) return;
+    const toe = currentCar.toeDeg || [ 0, 0, 0, 0 ];
+    for ( let i = 0; i < 4; i ++ ) {
+
+        vehicleController.setWheelSteering( i, toe[ i ] * _DEG );
+
+    }
+
+}
+
+function updateSuspensionGeometry() {
+
+    if ( ! vehicleController || ! currentCar ) return;
+    const camber = currentCar.camberDeg || [ 0, 0, 0, 0 ];
+    for ( let i = 0; i < 4; i ++ ) {
+
+        const cVal = camber[ i ];
+        const cMag = Math.abs( cVal );
+        if ( cMag < 0.01 ) {
+
+            vehicleController.setWheelSideFrictionStiffness( i, 1.0 );
+            continue;
+
+        }
+        const load = vehicleController.wheelIsInContact( i )
+            ? Math.max( 0, vehicleController.wheelSuspensionForce( i ) )
+            : 0;
+        const loadFactor = load / TIRE_LOAD_REF;
+        // Negative camber (top-leans-in) is the configured race setup → bonus
+        // grip under load. Positive camber would reduce it. Penalty term scales
+        // with magnitude either way (any camber away from 0° costs straight-line grip).
+        const gain = - cVal * CAMBER_GRIP_PER_DEG * loadFactor;
+        const penalty = cMag * CAMBER_STRAIGHT_COST * _DEG;
+        const mult = Math.max( 0.5, 1.0 + gain - penalty );
+        vehicleController.setWheelSideFrictionStiffness( i, mult );
+
+    }
+
+}
+
+// ---------------- drivetrain v2 (engine flywheel + clutch + LSD) ----------------
+// Engine has its own angular velocity with flywheel inertia — no longer slaved
+// kinematically to wheel speed. Clutch couples engine and wheels through a stiff
+// spring; opens during shifts. LSD biases torque to the slower drive wheel.
+
+const _OMEGA_PER_RPM = 2 * Math.PI / 60;
+const _RPM_PER_OMEGA = 60 / ( 2 * Math.PI );
+
+const drivetrain = {
+    engineOmega: 900 * _OMEGA_PER_RPM, // start at idle
+    lastWheelRotation: [ 0, 0, 0, 0 ],
+    wheelOmega: [ 0, 0, 0, 0 ],
+    clutchTorque: 0,
+    clutchOpen: true
+};
+
+function resetDrivetrain() {
+
+    drivetrain.engineOmega = ( engine.idleRpm || 900 ) * _OMEGA_PER_RPM;
+    drivetrain.clutchTorque = 0;
+    drivetrain.clutchOpen = true;
+    for ( let i = 0; i < 4; i ++ ) {
+
+        // Seed lastWheelRotation from the live wheel so the first-frame
+        // finite-difference doesn't generate a fake huge ω.
+        drivetrain.lastWheelRotation[ i ] = vehicleController ? ( vehicleController.wheelRotation( i ) || 0 ) : 0;
+        drivetrain.wheelOmega[ i ] = 0;
+
+    }
+
+}
+
+function _idleGovernor( omegaRpm ) {
+
+    const target = engine.idleRpm + 200;
+    if ( omegaRpm >= target ) return 0;
+    return ( target - omegaRpm ) / target;
+
+}
+
+function updateDrivetrain( dt, throttle, ratio, brake ) {
+
+    if ( ! vehicleController ) return;
+
+    // 1) wheel ω from wheelRotation finite-difference, light low-pass.
+    for ( let i = 0; i < 4; i ++ ) {
+
+        const theta = vehicleController.wheelRotation( i ) || 0;
+        let dTheta = theta - drivetrain.lastWheelRotation[ i ];
+        if ( dTheta > Math.PI ) dTheta -= 2 * Math.PI;
+        if ( dTheta < - Math.PI ) dTheta += 2 * Math.PI;
+        drivetrain.lastWheelRotation[ i ] = theta;
+        const raw = dTheta / Math.max( dt, 1e-4 );
+        drivetrain.wheelOmega[ i ] = drivetrain.wheelOmega[ i ] * 0.6 + raw * 0.4;
+
+    }
+
+    // 2) Engine torque has TWO components:
+    //    - playerTorque: what the driver actually asked for (throttle). This is
+    //      what's available to transmit through the clutch to the wheels.
+    //    - idleTorque: internal anti-stall, ONLY spins the flywheel — never
+    //      reaches the wheels. Real engines maintain idle via spark + fuel that
+    //      doesn't get passed to the gearbox.
+    const rpm = drivetrain.engineOmega * _RPM_PER_OMEGA;
+    const torqueBell = torqueAt( rpm );
+    const playerTorque = Math.max( 0, throttle ) * torqueBell * currentCar.maxEngineForce;
+    const idleTorque = _idleGovernor( rpm ) * torqueBell * currentCar.maxEngineForce;
+
+    // 3) Internal friction. Brake adds a small engine-braking bleed.
+    const frictionCoef = 0.00018 + 0.00045 * brake;
+    const engineFriction = frictionCoef * drivetrain.engineOmega * currentCar.maxEngineForce;
+
+    // 4) Clutch. Open during shifts (`shiftCooldown > 0`) and in neutral.
+    //    Saturation is bounded by the PLAYER-requested torque plus a tiny creep
+    //    allowance (so automatics inch forward at a stop, brake disables creep).
+    const clutchOpen = transmission.shiftCooldown > 0 || ratio === 0;
+    drivetrain.clutchOpen = clutchOpen;
+    let clutchTorque = 0;
+    if ( ! clutchOpen ) {
+
+        const gearMult = Math.abs( ratio ) * currentCar.finalDrive;
+        const wheelOmegaAvg = 0.5 * ( drivetrain.wheelOmega[ 0 ] + drivetrain.wheelOmega[ 1 ] );
+        const wheelEquivAtClutch = wheelOmegaAvg * gearMult * Math.sign( ratio );
+        const slip = drivetrain.engineOmega - wheelEquivAtClutch;
+        // Clutch saturation is sized like a real clutch — fixed friction limit,
+        // NOT scaled with current throttle. Real clutches transmit up to about
+        // 1.5× engine peak torque; the engine finds equilibrium via slip.
+        // We DO gate the FORWARD-drive direction by throttle (so off-throttle
+        // doesn't push the car forward), but keep the REVERSE direction at
+        // ~half peak so engine-braking still works when coasting off throttle.
+        const maxFwd = ( throttle > 0.05 )
+            ? currentCar.maxEngineForce * 1.5
+            : ( brake > 0.05 ? 0 : currentCar.maxEngineForce * 0.03 );
+        const maxRev = currentCar.maxEngineForce * 0.5;
+        let raw = slip * currentCar.clutchStiffness * 0.05;
+        if ( raw > maxFwd ) raw = maxFwd;
+        if ( raw < - maxRev ) raw = - maxRev;
+        clutchTorque = raw;
+
+    }
+    drivetrain.clutchTorque = clutchTorque;
+
+    // 5) Integrate flywheel: dω = (T_player + T_idle − T_friction − T_clutch) / I.
+    //    Both engine torque components add to the flywheel; only T_clutch leaves
+    //    via the gearbox.
+    const netTorque = playerTorque + idleTorque - engineFriction - clutchTorque;
+    drivetrain.engineOmega += ( netTorque / currentCar.engineInertia ) * dt;
+
+    const stallOmega = engine.idleRpm * 0.8 * _OMEGA_PER_RPM;
+    const redlineOmega = engine.redline * 1.02 * _OMEGA_PER_RPM;
+    if ( drivetrain.engineOmega < stallOmega ) drivetrain.engineOmega = stallOmega;
+    if ( drivetrain.engineOmega > redlineOmega ) drivetrain.engineOmega = redlineOmega;
+
+    // Publish to existing engine.rpm so HUD / audio remain unchanged.
+    engine.rpm = drivetrain.engineOmega * _RPM_PER_OMEGA;
+
+    // 6) Split clutch torque across drive wheels (front-wheel-drive only here).
+    //    LSD bias: factor=0 → open diff (equal split), factor=1 → fully locked
+    //    (all torque to slower wheel).
+    //
+    //    NOTE: we do NOT gear-amplify clutchTorque here. The torqueAt(rpm) curve
+    //    and per-car maxEngineForce together produce values calibrated for the
+    //    wheel-side (matching the original simple model). Multiplying by
+    //    gearMult would 10×+ amplify creep at idle into a real launch.
+    let wheelTorque0 = 0, wheelTorque1 = 0;
+    if ( ! clutchOpen ) {
+
+        const totalAtWheels = clutchTorque * Math.sign( ratio );
+        const w0 = Math.abs( drivetrain.wheelOmega[ 0 ] );
+        const w1 = Math.abs( drivetrain.wheelOmega[ 1 ] );
+        const fast = Math.max( w0, w1, 0.1 );
+        const slow = Math.min( w0, w1 );
+        const lockingExp = Math.max( 0.05, 4 * ( 1 - currentCar.lsdLocking ) );
+        const bias = Math.pow( slow / fast, lockingExp );
+        const slowShare = 0.5 + 0.5 * ( 1 - bias );
+        const fastShare = 1 - slowShare;
+        if ( w0 <= w1 ) {
+
+            wheelTorque0 = totalAtWheels * slowShare;
+            wheelTorque1 = totalAtWheels * fastShare;
+
+        } else {
+
+            wheelTorque0 = totalAtWheels * fastShare;
+            wheelTorque1 = totalAtWheels * slowShare;
+
+        }
+
+    }
+
+    // Rapier convention: NEGATIVE engine force = forward motion.
+    vehicleController.setWheelEngineForce( 0, - wheelTorque0 );
+    vehicleController.setWheelEngineForce( 1, - wheelTorque1 );
+
+}
+
+// ---------------- aerodynamics ----------------
+// F_drag    = Cd × v²  applied opposite to velocity
+// F_downforce = Cl × v²  applied in -Y world
+// Per-car Cd / Cl already baked into each CARS entry by the planning subagent
+// so engine force ≈ Cd × topSpeed² balances at the target top speed.
+
+const _aeroVel = new THREE.Vector3();
+const _aeroImpulse = { x: 0, y: 0, z: 0 };
+
+function updateAerodynamics( dt ) {
+
+    if ( ! chassis || ! currentCar ) return;
+    const v = chassis.linvel();
+    const speed2 = v.x * v.x + v.y * v.y + v.z * v.z;
+    if ( speed2 < 25 ) return; // < 5 m/s, skip — no meaningful aero at low speed
+
+    const Cd = currentCar.Cd || 0;
+    const Cl = currentCar.Cl || 0;
+    if ( Cd <= 0 && Cl <= 0 ) return;
+
+    const speed = Math.sqrt( speed2 );
+    // Drag impulse opposite velocity. F = Cd × v², impulse = F × dt, then split
+    // back across components via the unit vector.
+    if ( Cd > 0 ) {
+
+        const dragMag = Cd * speed2;
+        const k = ( dragMag * dt ) / speed;
+        _aeroImpulse.x = - v.x * k;
+        _aeroImpulse.y = - v.y * k;
+        _aeroImpulse.z = - v.z * k;
+        chassis.applyImpulse( _aeroImpulse, true );
+
+    }
+
+    // Downforce: F = Cl × v² straight down in world. Pure load, no pitch torque.
+    if ( Cl > 0 ) {
+
+        _aeroImpulse.x = 0;
+        _aeroImpulse.y = - Cl * speed2 * dt;
+        _aeroImpulse.z = 0;
+        chassis.applyImpulse( _aeroImpulse, true );
+
+    }
+
+}
+
+// ---------------- brake lights + reverse light ----------------
+
+function updateBrakeLights() {
+
+    if ( ! carVisualsGroup ) return;
+    const braking = input.brake > 0.05;
+    const inReverse = transmission.gear === - 1;
+    carVisualsGroup.traverse( ( o ) => {
+
+        if ( ! o.userData.taillight ) return;
+        // Brake boosts emissive ~2.3× over the per-car base (so muscle pops
+        // harder than the hatchback).
+        o.material.emissiveIntensity = o.userData.baseEmissiveIntensity * ( braking ? 2.3 : 1.0 );
+        if ( o.userData.reverseLight ) {
+
+            if ( inReverse ) {
+
+                o.material.color.setHex( 0xFFFFFF );
+                o.material.emissive.setHex( 0xFFFFFF );
+
+            } else {
+
+                o.material.color.setHex( o.userData.baseColor );
+                o.material.emissive.setHex( o.userData.baseEmissiveColor );
+
+            }
+
+        }
+
+    } );
+
+}
+
+// ---------------- skid marks ----------------
+
+const SKID_MAX = 800;
+let skidMesh = null;
+let skidIndex = 0;
+const _skidDummy = new THREE.Object3D();
+const _skidQuat = new THREE.Quaternion();
+const _skidEuler = new THREE.Euler();
+const _skidZeroMatrix = new THREE.Matrix4().makeScale( 0, 0, 0 );
+
+function initSkidMarks() {
+
+    // Single InstancedMesh = 1 draw call for up to 800 marks. PlaneGeometry
+    // rotated to lie flat in XZ so its normal is +Y (faces up).
+    const geom = new THREE.PlaneGeometry( 0.4, 0.55 );
+    geom.rotateX( - Math.PI / 2 );
+    const mat = new THREE.MeshBasicMaterial( {
+        color: 0x111111, transparent: true, opacity: 0.6,
+        depthWrite: false, polygonOffset: true, polygonOffsetFactor: - 2
+    } );
+    skidMesh = new THREE.InstancedMesh( geom, mat, SKID_MAX );
+    skidMesh.frustumCulled = false;
+    skidMesh.castShadow = false;
+    skidMesh.receiveShadow = false;
+    for ( let i = 0; i < SKID_MAX; i ++ ) skidMesh.setMatrixAt( i, _skidZeroMatrix );
+    skidMesh.instanceMatrix.needsUpdate = true;
+    scene.add( skidMesh );
+
+}
+
+function placeSkidMark( cp, headingY ) {
+
+    _skidDummy.position.set( cp.x, cp.y + 0.025, cp.z );
+    _skidDummy.rotation.set( 0, headingY, 0 );
+    _skidDummy.updateMatrix();
+    skidMesh.setMatrixAt( skidIndex, _skidDummy.matrix );
+    skidIndex = ( skidIndex + 1 ) % SKID_MAX;
+
+}
+
+function updateSkidMarks() {
+
+    if ( ! vehicleController || ! skidMesh || ! chassis ) return;
+    const speed = Math.abs( vehicleController.currentVehicleSpeed() );
+    if ( speed < 2 ) return; // no marks when crawling / parked
+
+    const r = chassis.rotation();
+    _skidQuat.set( r.x, r.y, r.z, r.w );
+    _skidEuler.setFromQuaternion( _skidQuat, 'YXZ' );
+
+    const handbraking = input.handbrake > 0.1;
+    let dirty = false;
+
+    // Rear wheels = indices 2 and 3. Hard lateral slip OR locked handbrake
+    // both leave marks. Lateral slip threshold 3.0 is tuned to "started
+    // drifting".
+    for ( const wi of [ 2, 3 ] ) {
+
+        if ( ! vehicleController.wheelIsInContact( wi ) ) continue;
+        const side = Math.abs( vehicleController.wheelSideImpulse( wi ) );
+        if ( side < 3.0 && ! handbraking ) continue;
+        const cp = vehicleController.wheelContactPoint( wi );
+        placeSkidMark( cp, _skidEuler.y );
+        dirty = true;
+
+    }
+
+    if ( dirty ) skidMesh.instanceMatrix.needsUpdate = true;
+
+}
+
+function clearSkidMarks() {
+
+    if ( ! skidMesh ) return;
+    for ( let i = 0; i < SKID_MAX; i ++ ) skidMesh.setMatrixAt( i, _skidZeroMatrix );
+    skidMesh.instanceMatrix.needsUpdate = true;
+    skidIndex = 0;
+
+}
+
+// ---------------- tire model (heat + wear) ----------------
+
+const tires = {
+    // Surface temp is what the grip curve reads. Carcass is the slow reservoir.
+    // Pressure rises with carcass temp. Wear is monotonic-decreasing.
+    // `heat` is kept as an alias for surface so the existing tile widget keeps working.
+    heat:        [ 25, 25, 25, 25 ],
+    carcass:     [ 25, 25, 25, 25 ],
+    pressure:    [ 200, 200, 200, 200 ], // kPa cold baseline (matches TIRE_P_COLD declared below)
+    wear:        [ 1.0, 1.0, 1.0, 1.0 ],
+    slipRatio:   [ 0, 0, 0, 0 ],         // longitudinal slip (live telemetry)
+    slipAngle:   [ 0, 0, 0, 0 ],         // lateral slip in rad (live telemetry)
+    gripMult:    [ 1, 1, 1, 1 ],         // last Pacejka multiplier (telemetry)
+    prevWheelRot:[ 0, 0, 0, 0 ]          // for finite-difference angular velocity
+};
+
+// Two-layer tyre thermal model + tyre pressure (Gay-Lussac) + Pacejka-flavoured
+// slip-grip curve. Surface temp drives grip + cools fast; carcass temp is the
+// bulk reservoir + slowly couples to surface via conduction. Pressure rises with
+// carcass temp and modulates contact-patch grip via a Gaussian around the cold-
+// optimum.
+const TIRE_AMBIENT       = 25;
+const TIRE_OPTIMAL_HEAT  = 90;     // surface temp peak (slightly raised from 80 — modern compounds)
+const TIRE_HEAT_SIGMA_SQ = 900;
+const TIRE_ROLL_GAIN     = 0.020;  // °C/s into carcass per (load_kN × m/s)
+const TIRE_SLIP_GAIN     = 0.85;   // °C/s into SURFACE per slip-unit
+const TIRE_FWD_SLIP_FAC  = 0.5;
+const TIRE_SURF_CARC_K   = 0.35;   // surface↔carcass conduction (per second)
+const TIRE_SURF_COOL_K   = 0.045;  // surface→air convection
+const TIRE_CARC_COOL_K   = 0.008;  // carcass→air (insulated, slow)
+const TIRE_COOL_VSCALE   = 28;     // m/s where forced cooling doubles
+const TIRE_AIR_COOL_K    = 0.05;   // airborne cooling
+const TIRE_LOAD_REF      = 1000;   // N
+const TIRE_HEAT_MIN      = 15;
+const TIRE_HEAT_MAX      = 160;
+const TIRE_WEAR_RATE     = 0.0015;
+
+// Pressure model
+const TIRE_P_COLD        = 200;    // kPa baseline
+const TIRE_P_COLD_T      = 25;     // °C
+const TIRE_P_OPTIMAL     = 230;    // kPa for peak grip
+const TIRE_P_SIGMA_SQ    = 800;
+const TIRE_P_GAIN        = 0.78;   // kPa per °C above cold
+const TIRE_P_GRIP_WEIGHT = 0.25;   // how much pressure deviation eats grip
+
+// Slip / Pacejka — we compute slipRatio (longitudinal) and slipAngle (lateral)
+// per wheel from chassis velocity + wheel angular velocity, then run them
+// through a smooth peak-and-drop curve. Below peak: full grip. Past peak:
+// grip drops linearly to a floor — so the player CAN lose grip by over-driving
+// (sim feel) but a stationary car never goes below baseline (no slide-on-the-spot).
+const PAC_PEAK_SLIP      = 0.14;   // ~14 % slip ratio = grip peak (typical road tyre)
+const PAC_PEAK_ANGLE     = 0.12;   // ~7° slip angle = lateral peak
+const PAC_FALLOFF        = 1.3;    // how steeply grip drops past the peak
+const PAC_GRIP_FLOOR     = 0.55;   // never less than this even at full slide
+const PAC_SLIP_RATIO_CAP = 2.0;    // saturation for snowy/locked wheels
+
+// Inverse-quaternion world→chassis-local vector (so we can decompose chassis
+// linear velocity into forward / lateral components).
+function _worldToLocalVec( v, q, out ) {
+
+    const x = v.x, y = v.y, z = v.z;
+    const qx = - q.x, qy = - q.y, qz = - q.z, qw = q.w;
+    const ix =  qw * x + qy * z - qz * y;
+    const iy =  qw * y + qz * x - qx * z;
+    const iz =  qw * z + qx * y - qy * x;
+    const iw = - qx * x - qy * y - qz * z;
+    out.x = ix * qw + iw * - qx + iy * - qz - iz * - qy;
+    out.y = iy * qw + iw * - qy + iz * - qx - ix * - qz;
+    out.z = iz * qw + iw * - qz + ix * - qy - iy * - qx;
+    return out;
+
+}
+const _carLocalVel = { x: 0, y: 0, z: 0 };
+
+function updateTires( dt ) {
+
+    if ( ! vehicleController || ! chassis ) return;
+
+    const vSpeed = Math.abs( vehicleController.currentVehicleSpeed() );
+    const linvel = chassis.linvel();
+    const r = chassis.rotation();
+    _worldToLocalVec( linvel, r, _carLocalVel );
+    // In chassis-local: +Z = back, -Z = forward. Our convention uses -Z forward,
+    // so vLong = -localV.z gives signed forward speed (positive when moving
+    // forward).
+    const vLong = - _carLocalVel.z;
+    const vLat  = _carLocalVel.x;
+
+    for ( let i = 0; i < 4; i ++ ) {
+
+        let Tsurf = tires.heat[ i ];
+        let Tcarc = tires.carcass[ i ];
+        const airV = vSpeed;
+        const conv = 1 + airV / TIRE_COOL_VSCALE;
+
+        if ( ! vehicleController.wheelIsInContact( i ) ) {
+
+            // Airborne — fast cooling of surface toward ambient. Carcass cools
+            // more slowly but also forced by airflow.
+            Tsurf += - TIRE_AIR_COOL_K * conv * ( Tsurf - TIRE_AMBIENT ) * dt;
+            Tcarc += - TIRE_CARC_COOL_K * conv * ( Tcarc - TIRE_AMBIENT ) * dt;
+            tires.heat[ i ] = Math.max( TIRE_HEAT_MIN, Math.min( TIRE_HEAT_MAX, Tsurf ) );
+            tires.carcass[ i ] = Math.max( TIRE_HEAT_MIN, Math.min( TIRE_HEAT_MAX, Tcarc ) );
+            tires.slipRatio[ i ] = 0;
+            tires.slipAngle[ i ] = 0;
+            tires.gripMult[ i ] = 1;
+            continue;
+
+        }
+
+        const load = Math.max( 0, vehicleController.wheelSuspensionForce( i ) ) / TIRE_LOAD_REF;
+        const sideI = Math.abs( vehicleController.wheelSideImpulse( i ) );
+        const fwdI  = Math.abs( vehicleController.wheelForwardImpulse( i ) );
+
+        // Slip ratio (longitudinal): difference between wheel-rim speed and
+        // contact-patch ground speed, normalised.
+        //
+        // IMPORTANT: we do NOT use `wheelRotation` here. Rapier's wheelRotation
+        // is the integral of its internal solver-decided angular velocity, which
+        // depends on the very friction value we feed back via setWheelFrictionSlip.
+        // That creates a feedback loop: low friction → Rapier holds ω low → we
+        // see vWheel ≈ 0 → kappa = -1 → pacFactor → 0.55 → friction lower next
+        // frame. Symptom: cruising cars showed slip ratio of -1 on all wheels.
+        //
+        // Instead derive vWheel kinematically from the drivetrain:
+        //   driven wheels (front, FWD): ω = engineOmega / gearMult
+        //   non-driven (rear)          : ω = vLong / WHEEL_RADIUS (free-rolling)
+        const isDriven = ( i === 0 || i === 1 );
+        const ratio = gearRatio( transmission.gear );
+        const engineOmegaRad = engine.rpm * Math.PI / 30; // RPM → rad/s
+        let vWheel;
+        if ( isDriven && ratio !== 0 && transmission.shiftCooldown <= 0 ) {
+
+            const gearMult = Math.abs( ratio ) * currentCar.finalDrive;
+            const idealOmega = engineOmegaRad / gearMult * Math.sign( ratio );
+            vWheel = idealOmega * WHEEL_RADIUS;
+
+        } else {
+
+            vWheel = vLong; // free-rolling matches ground
+
+        }
+        const denom = Math.max( Math.abs( vLong ), 0.5 );
+        let kappa = ( vWheel - vLong ) / denom;
+        if ( kappa > PAC_SLIP_RATIO_CAP ) kappa = PAC_SLIP_RATIO_CAP;
+        if ( kappa < - PAC_SLIP_RATIO_CAP ) kappa = - PAC_SLIP_RATIO_CAP;
+
+        // Slip angle (lateral): atan2(vLat, |vLong|). Only meaningful above
+        // very low speeds — at standstill it's noise.
+        let alpha = 0;
+        if ( vSpeed > 0.5 ) alpha = Math.atan2( vLat, Math.abs( vLong ) + 0.5 );
+        if ( alpha > Math.PI / 2 ) alpha = Math.PI / 2;
+        if ( alpha < - Math.PI / 2 ) alpha = - Math.PI / 2;
+
+        tires.slipRatio[ i ] = kappa;
+        tires.slipAngle[ i ] = alpha;
+
+        // Combined slip magnitude. We deliberately use ONLY the lateral
+        // (slip-angle) component for the Pacejka falloff. Slip ratio is kept
+        // for telemetry but doesn't feed grip back: our model derives engine
+        // RPM kinematically from wheel speed, so slip ratio can't physically
+        // detect wheel-spin without a real engine flywheel — which we don't
+        // have. The lateral term is a genuine physical signal (chassis side-
+        // slip relative to heading), so cornering-limit drift still works.
+        const latRatio = Math.abs( alpha ) / PAC_PEAK_ANGLE;
+        const slipMag = latRatio;
+
+        // Pacejka-flavoured grip multiplier: full grip below peak, drops past
+        // it, floored so we never lose all grip and slide off the road parked.
+        let pacFactor;
+        if ( slipMag < 1.0 ) {
+
+            pacFactor = 1.0;
+
+        } else {
+
+            pacFactor = Math.max( PAC_GRIP_FLOOR, 1.0 - ( slipMag - 1.0 ) * PAC_FALLOFF );
+
+        }
+
+        // Thermal: surface heats from slip-impulse (already a proxy for slip
+        // power); carcass heats from rolling deformation. They couple by
+        // conduction, both cool to ambient.
+        const slip = sideI + TIRE_FWD_SLIP_FAC * fwdI;
+        const qSurfIn = TIRE_SLIP_GAIN * slip;
+        const qRollIn = TIRE_ROLL_GAIN * load * vSpeed;
+        const cond = TIRE_SURF_CARC_K * ( Tsurf - Tcarc );
+        const qSurfOut = TIRE_SURF_COOL_K * conv * ( Tsurf - TIRE_AMBIENT );
+        const qCarcOut = TIRE_CARC_COOL_K * conv * ( Tcarc - TIRE_AMBIENT );
+        Tsurf += ( qSurfIn - cond - qSurfOut ) * dt;
+        Tcarc += ( qRollIn + cond - qCarcOut ) * dt;
+        if ( Tsurf < TIRE_HEAT_MIN ) Tsurf = TIRE_HEAT_MIN;
+        if ( Tsurf > TIRE_HEAT_MAX ) Tsurf = TIRE_HEAT_MAX;
+        if ( Tcarc < TIRE_HEAT_MIN ) Tcarc = TIRE_HEAT_MIN;
+        if ( Tcarc > TIRE_HEAT_MAX ) Tcarc = TIRE_HEAT_MAX;
+        tires.heat[ i ] = Tsurf;
+        tires.carcass[ i ] = Tcarc;
+
+        // Pressure: Gay-Lussac on carcass temp. Hotter = more pressure.
+        tires.pressure[ i ] = TIRE_P_COLD + TIRE_P_GAIN * ( Tcarc - TIRE_P_COLD_T );
+
+        // Wear: slip-only, never recovers, accelerated past 110°C surface.
+        const wearRate = slip * TIRE_WEAR_RATE
+            + 0.0008 * Math.max( 0, Tsurf - 110 );
+        tires.wear[ i ] = Math.max( 0.2, tires.wear[ i ] - wearRate * dt );
+
+        // Final grip = base × Pacejka × surfaceTemp × pressure × wear
+        const heatDelta = Tsurf - TIRE_OPTIMAL_HEAT;
+        const heatFactor = Math.exp( - heatDelta * heatDelta / TIRE_HEAT_SIGMA_SQ );
+        const pDelta = tires.pressure[ i ] - TIRE_P_OPTIMAL;
+        const pressFactor = ( 1 - TIRE_P_GRIP_WEIGHT ) + TIRE_P_GRIP_WEIGHT * Math.exp( - pDelta * pDelta / TIRE_P_SIGMA_SQ );
+
+        // Cold tyres still have usable mechanical grip — only the *peak* falls
+        // off when off-temperature. Floor raised from 0.4 → 0.7 so a fresh
+        // spawn doesn't slide off a slope before the player gets to drive.
+        const totalMult = pacFactor
+            * ( 0.7 + 0.3 * heatFactor )
+            * pressFactor
+            * ( 0.5 + 0.5 * tires.wear[ i ] );
+        tires.gripMult[ i ] = totalMult;
+
+        const grip = currentCar.wheelFrictionSlip * totalMult;
+        vehicleController.setWheelFrictionSlip( i, grip );
+
+    }
+
+}
+
+function resetTires() {
+
+    for ( let i = 0; i < 4; i ++ ) {
+
+        tires.heat[ i ] = TIRE_AMBIENT;
+        tires.carcass[ i ] = TIRE_AMBIENT;
+        tires.pressure[ i ] = TIRE_P_COLD;
+        tires.wear[ i ] = 1.0;
+        tires.slipRatio[ i ] = 0;
+        tires.slipAngle[ i ] = 0;
+        tires.gripMult[ i ] = 1;
+        // Seed from current wheel rotation so the next-frame finite-difference
+        // doesn't manufacture a fake huge omega from a 0-to-N angle jump.
+        tires.prevWheelRot[ i ] = vehicleController ? ( vehicleController.wheelRotation( i ) || 0 ) : 0;
+
+    }
 
 }
 
@@ -745,7 +1365,10 @@ const CARS = [
         wheelFrictionSlip: 2.0,
         suspensionStiffness: 24, suspensionCompression: 2.0, suspensionRelaxation: 2.4,
         suspensionRestLength: 0.4, wheelConnectionY: - 0.3,
-        maxBrakeForce: 1.2, handbrakeMultiplier: 1.6, maxSteeringAngle: Math.PI / 4
+        maxBrakeForce: 1.2, handbrakeMultiplier: 1.6, maxSteeringAngle: Math.PI / 4,
+        camberDeg: [ - 0.5, - 0.5, - 0.3, - 0.3 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
+        engineInertia: 0.15, clutchStiffness: 280, lsdLocking: 0.30,
+        Cd: 0.0240, Cl: 0.0000
     },
     // Muscle V8 — 1700 kg Mustang GT class; heavy nose, fat low-end torque.
     {
@@ -761,7 +1384,10 @@ const CARS = [
         wheelFrictionSlip: 1.8,
         suspensionStiffness: 22, suspensionCompression: 1.9, suspensionRelaxation: 2.3,
         suspensionRestLength: 0.42, wheelConnectionY: - 0.32,
-        maxBrakeForce: 1.4, handbrakeMultiplier: 1.7, maxSteeringAngle: Math.PI / 4.2
+        maxBrakeForce: 1.4, handbrakeMultiplier: 1.7, maxSteeringAngle: Math.PI / 4.2,
+        camberDeg: [ - 1, - 1, - 0.5, - 0.5 ], toeDeg: [ 0, 0, 0.1, 0.1 ],
+        engineInertia: 0.18, clutchStiffness: 320, lsdLocking: 0.35,
+        Cd: 0.0207, Cl: 0.0000
     },
     // Sport Flat-six — 1430 kg 911 GT3 class.
     {
@@ -777,7 +1403,10 @@ const CARS = [
         wheelFrictionSlip: 3.0,
         suspensionStiffness: 34, suspensionCompression: 2.6, suspensionRelaxation: 2.9,
         suspensionRestLength: 0.32, wheelConnectionY: - 0.28,
-        maxBrakeForce: 1.9, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4
+        maxBrakeForce: 1.9, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
+        camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ - 0.1, - 0.1, 0.15, 0.15 ],
+        engineInertia: 0.10, clutchStiffness: 500, lsdLocking: 0.65,
+        Cd: 0.0119, Cl: 0.0040
     },
     // Rally Turbo — WRX STI class; AWD-feel grip, broad turbo plateau.
     {
@@ -793,7 +1422,10 @@ const CARS = [
         wheelFrictionSlip: 2.5,
         suspensionStiffness: 26, suspensionCompression: 2.1, suspensionRelaxation: 2.5,
         suspensionRestLength: 0.48, wheelConnectionY: - 0.34,
-        maxBrakeForce: 1.7, handbrakeMultiplier: 2.2, maxSteeringAngle: Math.PI / 3.8
+        maxBrakeForce: 1.7, handbrakeMultiplier: 2.2, maxSteeringAngle: Math.PI / 3.8,
+        camberDeg: [ - 1, - 1, - 0.8, - 0.8 ], toeDeg: [ 0, 0, 0, 0 ],
+        engineInertia: 0.12, clutchStiffness: 450, lsdLocking: 0.80,
+        Cd: 0.0298, Cl: 0.0030
     },
     // Supercar V12 — Ferrari 812 class.
     {
@@ -809,7 +1441,10 @@ const CARS = [
         wheelFrictionSlip: 2.8,
         suspensionStiffness: 32, suspensionCompression: 2.5, suspensionRelaxation: 2.8,
         suspensionRestLength: 0.30, wheelConnectionY: - 0.26,
-        maxBrakeForce: 2.0, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4
+        maxBrakeForce: 2.0, handbrakeMultiplier: 1.8, maxSteeringAngle: Math.PI / 4,
+        camberDeg: [ - 1.5, - 1.5, - 0.8, - 0.8 ], toeDeg: [ - 0.15, - 0.15, 0.2, 0.2 ],
+        engineInertia: 0.09, clutchStiffness: 600, lsdLocking: 0.75,
+        Cd: 0.0177, Cl: 0.0090
     },
     // F1 — 798 kg open-wheeler with V10-era 18000 rpm scream.
     {
@@ -825,7 +1460,10 @@ const CARS = [
         wheelFrictionSlip: 4.0,
         suspensionStiffness: 55, suspensionCompression: 3.4, suspensionRelaxation: 3.6,
         suspensionRestLength: 0.18, wheelConnectionY: - 0.20,
-        maxBrakeForce: 3.0, handbrakeMultiplier: 1.5, maxSteeringAngle: Math.PI / 4.5
+        maxBrakeForce: 3.0, handbrakeMultiplier: 1.5, maxSteeringAngle: Math.PI / 4.5,
+        camberDeg: [ - 3.5, - 3.5, - 1.8, - 1.8 ], toeDeg: [ - 0.3, - 0.3, 0.3, 0.3 ],
+        engineInertia: 0.05, clutchStiffness: 800, lsdLocking: 1.00,
+        Cd: 0.0207, Cl: 0.0450
     },
     // God Car — physically impossible: max grip, 10 gears, flat torque, near-instant stops.
     {
@@ -841,7 +1479,10 @@ const CARS = [
         wheelFrictionSlip: 5.0,
         suspensionStiffness: 45, suspensionCompression: 3.0, suspensionRelaxation: 3.2,
         suspensionRestLength: 0.30, wheelConnectionY: - 0.26,
-        maxBrakeForce: 5.0, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4
+        maxBrakeForce: 5.0, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4,
+        camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ 0, 0, 0, 0 ],
+        engineInertia: 0.04, clutchStiffness: 1200, lsdLocking: 1.00,
+        Cd: 0.0144, Cl: 0.0600
     }
 ];
 
@@ -1020,6 +1661,7 @@ async function init() {
     initTouchControls();
     initCarToast();
     initMinimap();
+    initSkidMarks();
 
     // First user gesture unlocks the AudioContext on every browser.
     const unlockAudio = () => { startAudio(); };
@@ -1468,8 +2110,9 @@ function createCar() {
     addWheel( 2, { x: - 1, y: wy, z: 1.5 }, mesh );
     addWheel( 3, { x: 1, y: wy, z: 1.5 }, mesh );
 
-    vehicleController.setWheelSteering( 0, currentCar.maxSteeringAngle );
-    vehicleController.setWheelSteering( 1, currentCar.maxSteeringAngle );
+    // Toe baked into steering channel; driver input adds an offset on top
+    // each frame in applyVehicleForces.
+    applySuspensionGeometry();
 
     buildAndMountSteeringWheel( currentCar );
 
@@ -1893,6 +2536,168 @@ function pushAndDrawGraph( id, v ) {
 
 }
 
+// Top-down rectangle of the four tires. Each tire shows its temperature, wear
+// %, and a background colour ramped from blue (cold) → green (optimal 80 °C)
+// → red (overheated 140 °C).
+function _sTireWidget( panel ) {
+
+    const wrap = document.createElement( 'div' );
+    wrap.style.cssText = 'margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:6px';
+    panel.appendChild( wrap );
+
+    const labels = [ 'FL', 'FR', 'RL', 'RR' ];
+    statsForNerds.tireBoxes = [];
+
+    for ( let i = 0; i < 4; i ++ ) {
+
+        const tire = document.createElement( 'div' );
+        tire.style.cssText = [
+            'padding:6px 8px', 'border-radius:5px',
+            'background:hsl(220,65%,42%)', 'color:#fff',
+            'display:flex', 'flex-direction:column', 'gap:1px',
+            'transition:background 120ms linear',
+            'box-shadow:inset 0 0 0 1px rgba(255,255,255,0.08)'
+        ].join( ';' );
+
+        const labelEl = document.createElement( 'div' );
+        labelEl.textContent = labels[ i ];
+        labelEl.style.cssText = 'font-size:9px;opacity:0.78;letter-spacing:1.8px;font-weight:600';
+
+        const heatEl = document.createElement( 'div' );
+        heatEl.style.cssText = 'font-size:16px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums';
+        heatEl.textContent = '40°';
+
+        const wearEl = document.createElement( 'div' );
+        wearEl.style.cssText = 'font-size:11px;opacity:0.92;font-variant-numeric:tabular-nums';
+        wearEl.textContent = '100%';
+
+        tire.appendChild( labelEl );
+        tire.appendChild( heatEl );
+        tire.appendChild( wearEl );
+        wrap.appendChild( tire );
+
+        statsForNerds.tireBoxes.push( { el: tire, heatEl, wearEl } );
+
+    }
+
+}
+
+function _heatToColor( heat ) {
+
+    // 20 °C → hue 220 (deep blue, cold) · 80 °C → hue 120 (green, optimal)
+    // 140 °C → hue 0 (red, overheated). Smooth HSL interpolation.
+    const t = Math.max( 0, Math.min( 1, ( heat - 20 ) / 120 ) );
+    const hue = 220 - t * 220;
+    // Pull saturation up at the extremes so cold/hot read more strongly.
+    const sat = 60 + Math.abs( t - 0.5 ) * 30;
+    return `hsl(${ hue.toFixed( 0 ) },${ sat.toFixed( 0 ) }%,42%)`;
+
+}
+
+function updateTireWidget() {
+
+    if ( ! statsForNerds.enabled || ! statsForNerds.tireBoxes ) return;
+    for ( let i = 0; i < 4; i ++ ) {
+
+        const box = statsForNerds.tireBoxes[ i ];
+        const heat = tires.heat[ i ];
+        const wear = tires.wear[ i ];
+        box.heatEl.textContent = heat.toFixed( 0 ) + '°';
+        box.wearEl.textContent = ( wear * 100 ).toFixed( 0 ) + '%';
+        box.el.style.background = _heatToColor( heat );
+
+    }
+
+}
+
+// 4-line graph for per-tire metrics. Each tire has its own colour line.
+function _sMultiGraph( panel, label, id, w, h, colors, legendLabels, min, max ) {
+
+    const wrap = document.createElement( 'div' );
+    wrap.style.cssText = 'margin-top:6px';
+
+    const lab = document.createElement( 'div' );
+    lab.style.cssText = 'font-size:10px;opacity:0.62;margin-bottom:2px;display:flex;justify-content:space-between;align-items:center';
+    const labTitle = document.createElement( 'span' );
+    labTitle.textContent = label;
+    lab.appendChild( labTitle );
+
+    // Tiny inline legend on the right of the header — 4 colour dots + labels.
+    const legend = document.createElement( 'span' );
+    legend.style.cssText = 'display:inline-flex;gap:6px';
+    for ( let i = 0; i < colors.length; i ++ ) {
+
+        const item = document.createElement( 'span' );
+        item.style.cssText = 'display:inline-flex;align-items:center;gap:3px;opacity:0.85';
+        const dot = document.createElement( 'span' );
+        dot.style.cssText = `display:inline-block;width:7px;height:7px;border-radius:2px;background:${ colors[ i ] }`;
+        item.appendChild( dot );
+        const lbl = document.createElement( 'span' );
+        lbl.textContent = legendLabels[ i ];
+        lbl.style.fontSize = '9px';
+        item.appendChild( lbl );
+        legend.appendChild( item );
+
+    }
+    lab.appendChild( legend );
+
+    wrap.appendChild( lab );
+
+    const canvas = document.createElement( 'canvas' );
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.cssText = `width:${ w }px;height:${ h }px;background:rgba(255,255,255,0.05);border-radius:3px;display:block`;
+    wrap.appendChild( canvas );
+    panel.appendChild( wrap );
+
+    statsForNerds.graphs[ id ] = {
+        canvas, ctx: canvas.getContext( '2d' ),
+        buffers: colors.map( () => [] ),
+        capacity: w, colors, min, max, multi: true
+    };
+
+}
+
+function pushAndDrawMultiGraph( id, values ) {
+
+    const g = statsForNerds.graphs[ id ];
+    if ( ! g || ! g.multi ) return;
+    for ( let i = 0; i < g.buffers.length; i ++ ) {
+
+        g.buffers[ i ].push( values[ i ] );
+        if ( g.buffers[ i ].length > g.capacity ) g.buffers[ i ].shift();
+
+    }
+    if ( ! statsForNerds.enabled ) return;
+
+    const { ctx, canvas, buffers, colors, min, max } = g;
+    const w = canvas.width;
+    const hh = canvas.height;
+    ctx.clearRect( 0, 0, w, hh );
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    ctx.fillRect( 0, hh - 1, w, 1 );
+
+    ctx.lineWidth = 1.2;
+    for ( let line = 0; line < buffers.length; line ++ ) {
+
+        const buf = buffers[ line ];
+        if ( buf.length === 0 ) continue;
+        ctx.strokeStyle = colors[ line ];
+        ctx.beginPath();
+        for ( let i = 0; i < buf.length; i ++ ) {
+
+            const x = w - buf.length + i;
+            const t = ( buf[ i ] - min ) / ( max - min );
+            const y = hh - Math.max( 0, Math.min( 1, t ) ) * hh;
+            if ( i === 0 ) ctx.moveTo( x, y ); else ctx.lineTo( x, y );
+
+        }
+        ctx.stroke();
+
+    }
+
+}
+
 function initStatsForNerds() {
 
     // Toggle button — small pill below the three.js Stats overlay.
@@ -1950,6 +2755,8 @@ function initStatsForNerds() {
     _sStat( drv, 'engine RPM', 's_rpm' );
     _sStat( drv, 'norm. torque', 's_torque', 'torque curve value at current RPM' );
     _sStat( drv, 'wheel engine F', 's_engineF', 'force applied to front wheels' );
+    _sStat( drv, 'clutch', 's_clutch', 'open during shifts / neutral, otherwise closed with slip torque' );
+    _sStat( drv, 'LSD bias', 's_lsdbias', 'torque split FL : FR (locked diff = always 50:50)' );
     _sStat( drv, 'speed', 's_speed' );
 
     _sGraph( panel, 'RPM', 'g_rpm', 280, 36, '#F5D04A', 0, 7500 );
@@ -1961,7 +2768,22 @@ function initStatsForNerds() {
     _sStat( wh, 'susp. force', 's_w_suspF' );
     _sStat( wh, 'fwd impulse', 's_w_fwdI' );
     _sStat( wh, 'side impulse', 's_w_sideI' );
+    _sStat( wh, 'slip ratio', 's_w_slipR', 'longitudinal slip — peak grip near ±0.14' );
+    _sStat( wh, 'slip angle °', 's_w_slipA', 'lateral slip in degrees — peak grip near ±7°' );
+    _sStat( wh, 'grip mult', 's_w_gripm', 'pacejka × heat × pressure × wear' );
+    _sStat( wh, 'pressure kPa', 's_w_press', 'cold 200 kPa → optimal 230 kPa' );
+    _sStat( wh, 'carcass °C', 's_w_carc', 'slow thermal reservoir' );
     _sStat( wh, 'brake', 's_w_brake' );
+    _sTireWidget( wh );
+
+    const aero = _sSection( panel, 'AERO' );
+    _sStat( aero, 'downforce N', 's_downf', 'Cl × v² applied -Y' );
+    _sStat( aero, 'drag N', 's_drag', 'Cd × v² opposite velocity' );
+    _sStat( aero, 'Cd · Cl', 's_aerocoef' );
+
+    const susp = _sSection( panel, 'SUSPENSION GEOMETRY' );
+    _sStat( susp, 'camber FL/FR/RL/RR', 's_camber' );
+    _sStat( susp, 'toe FL/FR/RL/RR', 's_toe' );
 
     const ch = _sSection( panel, 'CHASSIS' );
     _sStat( ch, 'pos', 's_pos' );
@@ -2013,6 +2835,7 @@ function updateStatsForNerds( speed ) {
     // recent history rather than starting from a flat line.
     pushAndDrawGraph( 'g_rpm', engine.rpm );
     pushAndDrawGraph( 'g_speed', Math.abs( speed ) * 3.6 );
+    updateTireWidget();
 
     if ( ! statsForNerds.enabled || ! chassis ) return;
 
@@ -2030,8 +2853,16 @@ function updateStatsForNerds( speed ) {
     _sset( 's_engineF', vehicleController.wheelEngineForce( 0 ).toFixed( 1 ) + ' N' );
     _sset( 's_speed', `${ ( Math.abs( speed ) * 3.6 ).toFixed( 1 ) } km/h · ${ Math.abs( speed ).toFixed( 2 ) } m/s` );
 
+    // Clutch state + LSD bias.
+    _sset( 's_clutch', drivetrain.clutchOpen ? 'OPEN' : `slip ${ drivetrain.clutchTorque.toFixed( 1 ) }` );
+    const eFL = Math.abs( vehicleController.wheelEngineForce( 0 ) );
+    const eFR = Math.abs( vehicleController.wheelEngineForce( 1 ) );
+    const eTot = Math.max( 0.01, eFL + eFR );
+    _sset( 's_lsdbias', `${ ( eFL / eTot * 100 ).toFixed( 0 ) } : ${ ( eFR / eTot * 100 ).toFixed( 0 ) }` );
+
     // Wheels — FL=0, FR=1, RL=2, RR=3 in our addWheel order.
     const wContact = [], wSusp = [], wSuspF = [], wFwdI = [], wSideI = [], wBrake = [];
+    const wSlipR = [], wSlipA = [], wGripM = [], wPress = [], wCarc = [];
     for ( let i = 0; i < 4; i ++ ) {
 
         wContact.push( vehicleController.wheelIsInContact( i ) ? '✓' : '·' );
@@ -2040,6 +2871,11 @@ function updateStatsForNerds( speed ) {
         wFwdI.push( vehicleController.wheelForwardImpulse( i ).toFixed( 1 ) );
         wSideI.push( vehicleController.wheelSideImpulse( i ).toFixed( 1 ) );
         wBrake.push( vehicleController.wheelBrake( i ).toFixed( 2 ) );
+        wSlipR.push( tires.slipRatio[ i ].toFixed( 2 ) );
+        wSlipA.push( ( tires.slipAngle[ i ] * 180 / Math.PI ).toFixed( 1 ) );
+        wGripM.push( tires.gripMult[ i ].toFixed( 2 ) );
+        wPress.push( tires.pressure[ i ].toFixed( 0 ) );
+        wCarc.push( tires.carcass[ i ].toFixed( 0 ) );
 
     }
     _sset( 's_w_contact', wContact.join( ' · ' ) );
@@ -2047,7 +2883,25 @@ function updateStatsForNerds( speed ) {
     _sset( 's_w_suspF', wSuspF.join( ' · ' ) );
     _sset( 's_w_fwdI', wFwdI.join( ' · ' ) );
     _sset( 's_w_sideI', wSideI.join( ' · ' ) );
+    _sset( 's_w_slipR', wSlipR.join( ' · ' ) );
+    _sset( 's_w_slipA', wSlipA.join( ' · ' ) );
+    _sset( 's_w_gripm', wGripM.join( ' · ' ) );
+    _sset( 's_w_press', wPress.join( ' · ' ) );
+    _sset( 's_w_carc', wCarc.join( ' · ' ) );
     _sset( 's_w_brake', wBrake.join( ' · ' ) );
+
+    // Aero + suspension geometry.
+    const linv = chassis.linvel();
+    const speed2 = linv.x * linv.x + linv.y * linv.y + linv.z * linv.z;
+    const cd = currentCar.Cd || 0;
+    const cl = currentCar.Cl || 0;
+    _sset( 's_downf', ( cl * speed2 ).toFixed( 0 ) + ' N' );
+    _sset( 's_drag', ( cd * speed2 ).toFixed( 0 ) + ' N' );
+    _sset( 's_aerocoef', `${ cd.toFixed( 4 ) } · ${ cl.toFixed( 4 ) }` );
+    const cm = currentCar.camberDeg || [ 0, 0, 0, 0 ];
+    const tt = currentCar.toeDeg || [ 0, 0, 0, 0 ];
+    _sset( 's_camber', cm.map( v => v.toFixed( 1 ) + '°' ).join( ' · ' ) );
+    _sset( 's_toe', tt.map( v => v.toFixed( 2 ) + '°' ).join( ' · ' ) );
 
     const t = chassis.translation();
     const v = chassis.linvel();
@@ -2085,6 +2939,26 @@ function _addCarMesh( parent, geom, mat, pos, rot ) {
 
 }
 
+// Tag a taillight so the per-frame brake-light updater can find it. When
+// `isReverse` is true we ALSO clone the material so we can swap that one
+// taillight's colour to white in reverse without affecting the other.
+function _addTaillight( parent, geom, mat, pos, isReverse ) {
+
+    const material = isReverse ? mat.clone() : mat;
+    const m = _addCarMesh( parent, geom, material, pos );
+    m.userData.taillight = true;
+    m.userData.baseEmissiveIntensity = material.emissiveIntensity;
+    if ( isReverse ) {
+
+        m.userData.reverseLight = true;
+        m.userData.baseColor = material.color.getHex();
+        m.userData.baseEmissiveColor = material.emissive.getHex();
+
+    }
+    return m;
+
+}
+
 function _buildHatchback( parent ) {
 
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
@@ -2096,7 +2970,7 @@ function _buildHatchback( parent ) {
     for ( const x of [ - 0.6, 0.6 ] ) {
 
         _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.08, - 1.86 ] );
-        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, - 0.02, 1.86 ] );
+        _addTaillight( parent, _visLightGeom, taillightMat, [ x, - 0.02, 1.86 ], true );
 
     }
 
@@ -2118,7 +2992,7 @@ function _buildMuscleV8( parent ) {
     for ( const x of [ - 0.65, 0.65 ] ) {
 
         _addCarMesh( parent, _visLightGeom, headlightMat, [ x, 0, - 1.86 ] );
-        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, 0.05, 1.86 ] );
+        _addTaillight( parent, _visLightGeom, taillightMat, [ x, 0.05, 1.86 ], true );
 
     }
 
@@ -2137,7 +3011,7 @@ function _buildSportFlatSix( parent ) {
     for ( const x of [ - 0.6, 0.6 ] ) {
 
         _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.18, - 1.86 ] );
-        _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.1, 0.08 ), taillightMat, [ x, 0.05, 1.86 ] );
+        _addTaillight( parent, new THREE.BoxGeometry( 0.6, 0.1, 0.08 ), taillightMat, [ x, 0.05, 1.86 ], true );
 
     }
 
@@ -2162,7 +3036,7 @@ function _buildRallyTurbo( parent ) {
     for ( const x of [ - 0.7, 0.7 ] ) {
 
         _addCarMesh( parent, _visLightGeom, headlightMat, [ x, 0.05, - 1.86 ] );
-        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, 0.1, 1.86 ] );
+        _addTaillight( parent, _visLightGeom, taillightMat, [ x, 0.1, 1.86 ], true );
 
     }
 
@@ -2183,7 +3057,7 @@ function _buildSupercarV12( parent ) {
     for ( const x of [ - 0.55, 0.55 ] ) {
 
         _addCarMesh( parent, new THREE.BoxGeometry( 0.4, 0.1, 0.08 ), headlightMat, [ x, - 0.18, - 1.86 ] );
-        _addCarMesh( parent, new THREE.BoxGeometry( 0.45, 0.1, 0.08 ), taillightMat, [ x, 0, 1.86 ] );
+        _addTaillight( parent, new THREE.BoxGeometry( 0.45, 0.1, 0.08 ), taillightMat, [ x, 0, 1.86 ], true );
 
     }
 
@@ -2204,7 +3078,7 @@ function _buildF1( parent ) {
     _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.35, 0.5 ), cockpitMat, [ 0, 0, 0.3 ] );
     _addCarMesh( parent, new THREE.BoxGeometry( 0.7, 0.08, 0.6 ), darkMat, [ 0, 0.4, 0.3 ], [ 0.3, 0, 0 ] );
     _addCarMesh( parent, new THREE.BoxGeometry( 0.6, 0.18, 0.6 ), bodyMat, [ 0, - 0.15, 1.0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.18, 0.08 ), taillightMat, [ 0, 0.1, 1.86 ] );
+    _addTaillight( parent, new THREE.BoxGeometry( 0.18, 0.18, 0.08 ), taillightMat, [ 0, 0.1, 1.86 ], true );
 
 }
 
@@ -2231,7 +3105,7 @@ function _buildGodCar( parent ) {
     for ( const x of [ - 0.6, 0.6 ] ) {
 
         _addCarMesh( parent, _visLightGeom, headlightMat, [ x, - 0.2, - 1.86 ] );
-        _addCarMesh( parent, _visLightGeom, taillightMat, [ x, 0, 1.86 ] );
+        _addTaillight( parent, _visLightGeom, taillightMat, [ x, 0, 1.86 ], true );
 
     }
 
@@ -2540,7 +3414,7 @@ function updateTransmission( dt, speed ) {
 
 }
 
-function applyVehicleForces( speed ) {
+function applyVehicleForces( speed, dt ) {
 
     if ( input.reset ) {
 
@@ -2554,6 +3428,9 @@ function applyVehicleForces( speed ) {
         input.reverseEngaged = false;
         input.sHeldTime = 0;
         chaseCam.initialized = false;
+        resetTires();
+        resetDrivetrain();
+        clearSkidMarks();
         return;
 
     }
@@ -2571,21 +3448,27 @@ function applyVehicleForces( speed ) {
     }
 
     const ratio = gearRatio( transmission.gear );
+
+    // Direct engine-force model (reverted from the clutch+flywheel drivetrain
+    // because the clutch's engine-braking force was overpowering the tire
+    // friction limit, locking the wheels at cruise and crashing the Pacejka
+    // grip multiplier into a feedback loop). The clutch state used by the
+    // stats panel is kept for telemetry but is now a thin signal.
     let engineForce = 0;
     if ( ratio !== 0 && throttleEffective > 0 ) {
 
         const torque = torqueAt( engine.rpm );
-        // Force pushes the chassis in the -Z (forward) direction for + ratio,
-        // and +Z for negative (reverse) ratio. Our convention from the original
-        // example: negative wheel engine force => forward motion.
         const magnitude = throttleEffective * torque * currentCar.maxEngineForce;
         engineForce = - magnitude * Math.sign( ratio );
 
     }
-
-    // Apply engine force to the front wheels (FWD).
+    // Split evenly across the two drive wheels (FWD).
     vehicleController.setWheelEngineForce( 0, engineForce );
     vehicleController.setWheelEngineForce( 1, engineForce );
+
+    // Light cosmetic clutch state for the stats display.
+    drivetrain.clutchOpen = transmission.shiftCooldown > 0 || ratio === 0;
+    drivetrain.clutchTorque = drivetrain.clutchOpen ? 0 : engineForce;
 
     // BRAKE.
     // In auto+reverseEngaged, the brake pedal is throttle so no braking from it.
@@ -2605,11 +3488,18 @@ function applyVehicleForces( speed ) {
     vehicleController.setWheelBrake( 2, Math.max( serviceBrake, handbrake ) );
     vehicleController.setWheelBrake( 3, Math.max( serviceBrake, handbrake ) );
 
-    // STEERING — smoothed. Max angle per car.
-    const currentSteering = vehicleController.wheelSteering( 0 );
-    const steering = THREE.MathUtils.lerp( currentSteering, currentCar.maxSteeringAngle * input.steer, 0.25 );
-    vehicleController.setWheelSteering( 0, steering );
-    vehicleController.setWheelSteering( 1, steering );
+    // STEERING — smoothed. Max angle per car. Toe is baked in as the *resting*
+    // steering angle, and driver input lerps an offset on top.
+    const toe = currentCar.toeDeg || [ 0, 0, 0, 0 ];
+    const toeFL = toe[ 0 ] * _DEG;
+    const toeFR = toe[ 1 ] * _DEG;
+    // Read current driver-steering offset by subtracting the toe contribution
+    // off the wheel. Both front wheels share the same driver offset.
+    const currentOffset = vehicleController.wheelSteering( 0 ) - toeFL;
+    const target = currentCar.maxSteeringAngle * input.steer;
+    const steering = THREE.MathUtils.lerp( currentOffset, target, 0.25 );
+    vehicleController.setWheelSteering( 0, toeFL + steering );
+    vehicleController.setWheelSteering( 1, toeFR + steering );
 
 }
 
@@ -2729,21 +3619,33 @@ function animate( time ) {
 
         updateInput( delta );
 
+        // Engine RPM is computed kinematically from wheel speed × gear ratio
+        // × final drive. Smoothed slightly so gear shifts don't snap the gauge.
         const targetRpm = computeRpm( speed, transmission.gear );
         const rpmAlpha = 1 - Math.exp( - 12 * delta );
         engine.rpm += ( targetRpm - engine.rpm ) * rpmAlpha;
 
         updateTransmission( delta, speed );
-        applyVehicleForces( speed );
 
-        // Order matters: updateVehicle applies suspension/engine forces TO the
-        // chassis body, then world.step integrates one timestep. Same dt for
-        // both so the wheel raycasts and the chassis pose match.
+        // Writes that the upcoming physics step will consume: engine force,
+        // brakes, steering, and chassis aero impulse.
+        applyVehicleForces( speed, delta );
+        updateAerodynamics( delta );
+
+        // updateVehicle applies suspension/engine forces TO the chassis body,
+        // then world.step integrates one timestep with the same dt.
         vehicleController.updateVehicle( delta );
         physics.step( delta );
 
+        // POST-STEP: read fresh sensor data (impulses, suspension force, wheel
+        // angular position) and write friction values for the NEXT frame.
+        updateSuspensionGeometry();
+        updateTires( delta );
+
         updateWheels();
         updateSpeedometer( speed );
+        updateBrakeLights();
+        updateSkidMarks();
 
         statsForNerds.lastDelta = delta;
         updateStatsForNerds( speed );

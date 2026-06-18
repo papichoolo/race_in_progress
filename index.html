@@ -35,6 +35,30 @@
             }
             #info p { margin: 2px 0; }
 
+            /* ── Custom scrollbars on the overlay panels ──────────────────
+               The stats-for-nerds panel scrolls; default OS scrollbars look
+               jarring on the dark glass theme. Target elements with
+               overflow-y:auto inside our overlays.                          */
+            *::-webkit-scrollbar {
+                width: 6px;
+                height: 6px;
+            }
+            *::-webkit-scrollbar-track {
+                background: rgba(255,255,255,0.04);
+                border-radius: 3px;
+            }
+            *::-webkit-scrollbar-thumb {
+                background: rgba(255,203,71,0.35);
+                border-radius: 3px;
+                transition: background 120ms;
+            }
+            *::-webkit-scrollbar-thumb:hover {
+                background: rgba(255,203,71,0.65);
+            }
+            *::-webkit-scrollbar-corner { background: transparent; }
+            /* Firefox */
+            * { scrollbar-width: thin; scrollbar-color: rgba(255,203,71,0.35) rgba(255,255,255,0.04); }
+
             /* ── Responsive overlays ─────────────────────────────────────────
                JS creates the speedometer / stats panels with inline styles,
                so the media queries below have to use !important to override
