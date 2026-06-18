@@ -1074,6 +1074,7 @@ const audio = {
     engineNode: null,   squealNode: null,
     engineGain: null,   squealGain: null,
     masterGain: null,
+    masterVolume: 0.4,  // user-controllable; survives AudioContext (re)creation
     smoothedSqueal: 0,
     engineBufferCache: new Map() // url → AudioBuffer, lazily populated per car swap
 };
@@ -1145,6 +1146,29 @@ async function swapEngineAudio( car ) {
 
 }
 
+function initVolumeSlider() {
+
+    const slider = document.getElementById( 'volumeSlider' );
+    const readout = document.getElementById( 'volumeValue' );
+    if ( ! slider ) return;
+
+    const saved = parseFloat( localStorage.getItem( 'masterVolume' ) );
+    if ( Number.isFinite( saved ) && saved >= 0 && saved <= 1 ) audio.masterVolume = saved;
+    slider.value = String( audio.masterVolume );
+    if ( readout ) readout.textContent = Math.round( audio.masterVolume * 100 );
+
+    slider.addEventListener( 'input', () => {
+
+        const v = parseFloat( slider.value );
+        audio.masterVolume = v;
+        if ( audio.masterGain ) audio.masterGain.gain.value = v;
+        if ( readout ) readout.textContent = Math.round( v * 100 );
+        localStorage.setItem( 'masterVolume', String( v ) );
+
+    } );
+
+}
+
 async function startAudio() {
 
     if ( audio.started ) return;
@@ -1156,7 +1180,7 @@ async function startAudio() {
     audio.ctx = ctx;
 
     audio.masterGain = ctx.createGain();
-    audio.masterGain.gain.value = 0.4;
+    audio.masterGain.gain.value = audio.masterVolume;
     audio.masterGain.connect( ctx.destination );
 
     try {
@@ -1662,6 +1686,7 @@ async function init() {
     initCarToast();
     initMinimap();
     initSkidMarks();
+    initVolumeSlider();
 
     // First user gesture unlocks the AudioContext on every browser.
     const unlockAudio = () => { startAudio(); };
