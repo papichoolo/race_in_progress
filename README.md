@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Make remote cars solid + collidable during the race, ghost otherwise (kinematic Rapier body per RemoteCar enabled on ready_check / countdown / racing; opaque visuals; back to translucent + non-colliding in lobby / finished) **(HEAD)**
+- Driveability pass: joystick map widget, non-linear steering curve + deadzone + speed-scaled max angle, traction control, residual-drift zero-snap, 60-second T-key telemetry recorder, new Stats-for-Nerds sections + steering / TC graphs, Map 2 spawn relocated to the new captured pose **(HEAD)**
 
 ## all commits
 
@@ -31,4 +31,5 @@
 - Drop the backfill bullet from the ledger [(6db0a34)](https://github.com/Eeman1113/race_in_progress/commit/6db0a34)
 - Add the missing ledger bullet for the prior cleanup commit [(4abe7ba)](https://github.com/Eeman1113/race_in_progress/commit/4abe7ba)
 - Add P2P multiplayer with ghost cars + race-to-first-lap (Trystero/nostr, no backend; shareable /CODE URL + GH-Pages SPA fallback for auto-join; ready-check with locked car selection; 1-2-3 countdown; host-wins map sync; per-peer random colors; live name + car tag updates on switch; spawn-slot offset so friends never land on you; initial-spawn handbrake held until first input) [(39b2fb0)](https://github.com/Eeman1113/race_in_progress/commit/39b2fb0)
-- Make remote cars solid + collidable during the race, ghost otherwise (kinematic Rapier body per RemoteCar enabled on ready_check / countdown / racing; opaque visuals; back to translucent + non-colliding in lobby / finished) **(HEAD)**
+- Make remote cars solid + collidable during the race, ghost otherwise (kinematic Rapier body per RemoteCar enabled on ready_check / countdown / racing; opaque visuals; back to translucent + non-colliding in lobby / finished) [(acf4e30)](https://github.com/Eeman1113/race_in_progress/commit/acf4e30)
+- Driveability pass: joystick map widget, non-linear steering curve + deadzone + speed-scaled max angle, traction control, residual-drift zero-snap, 60-second T-key telemetry recorder, new Stats-for-Nerds sections + steering / TC graphs, Map 2 spawn relocated to the new captured pose **(HEAD)**

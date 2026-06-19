@@ -447,7 +447,11 @@ const drivetrain = {
     lastWheelRotation: [ 0, 0, 0, 0 ],
     wheelOmega: [ 0, 0, 0, 0 ],
     clutchTorque: 0,
-    clutchOpen: true
+    clutchOpen: true,
+    // Traction-control telemetry — updated each frame by applyVehicleForces.
+    // `cutPct` is the largest fractional torque cut across driven wheels, in
+    // [0,1]. `engaged` is sticky for ~120ms so the UI light stays visible.
+    tc: { cutPct: 0, engaged: false, engagedUntil: 0, eventCount: 0 }
 };
 
 function resetDrivetrain() {
@@ -2830,7 +2834,8 @@ const CONTROLS_KEYBOARD = [
     'L⇧ · upshift  ·  L⌃ · downshift',
     'R · reset',
     'C · cycle camera (chase / free / pov)',
-    '1 / 2 · cycle map'
+    '1 / 2 · cycle map',
+    'T · record 60s telemetry (input + output → JSON)'
 ];
 
 const CONTROLS_GAMEPAD = [
@@ -3094,6 +3099,10 @@ const input = {
     throttle: 0,
     brake: 0,
     steer: 0,
+    // Pre-curve combined input (keyboard ∪ gamepad ∪ touch), for the joystick
+    // map widget and telemetry. `steer` above is the post-curve / post-deadzone
+    // value that actually drives the wheel target angle.
+    steerRaw: 0,
     handbrake: 0,
     reset: false,
     // raw key states so we can hold + combine
@@ -3108,6 +3117,64 @@ const input = {
     // the player has even touched a key. Released by updateInput() the
     // first frame _anyInputActive() returns true.
     handbrakeAfterReset: true
+};
+
+// Steering tuning — non-linear curve + speed-sensitive max angle + dt-aware
+// smoothing. The old pipeline was a flat lerp on a linear input which made
+// the car spin out in high-speed corners because the full mechanical angle
+// was available at any speed. The settings below are exposed at module
+// scope so they can be tweaked live from the console.
+const steeringCfg = {
+    deadzone: 0.045,            // extra deadzone applied AFTER source merging
+    curveExponent: 1.7,         // 1.0 = linear; >1 = softer near center
+    // Speed-sensitive reduction. Max steering scales from 1.0 at standstill
+    // down to `minFactor` at `vReduceMax` m/s and stays clamped above that.
+    minFactor: 0.40,
+    vReduceMax: 55,             // m/s ≈ 198 km/h
+    // dt-aware smoothing rates. Return-to-center is faster than steer-in so
+    // the car settles back to straight rather than asymptotically lingering.
+    smoothInRate: 14,
+    smoothReturnRate: 22,
+    // Snap-to-zero threshold (radians) when the target is zero. Catches the
+    // long tail of the exponential decay so the wheels actually reach 0.
+    zeroSnapRad: 0.001
+};
+
+// Traction control — cuts engine force per-driven-wheel when the
+// longitudinal slip ratio exceeds the peak-grip threshold. Without this,
+// stomping the throttle mid-corner sends the drive tyres past peak slip and
+// the car washes wide / spins. Live state is mirrored to `drivetrain.tc`
+// for the stats panel.
+const tcCfg = {
+    enabled: true,
+    slipThreshold: 0.16,        // peak Pacejka slip is ~0.14
+    cutGain: 4.5,               // torque cut per unit of slip overshoot
+    minMult: 0.18,              // never cut all the way to zero
+    // Low-speed exemption: TC is annoying when crawling out of a spawn /
+    // doing a hill-start, so disable below this speed (m/s).
+    minActiveSpeed: 1.2
+};
+
+// Per-frame steering-pipeline telemetry — populated by applyVehicleForces,
+// consumed by the joystick map widget and the stats-for-nerds diagnostics.
+const steeringTelemetry = {
+    target: 0,       // desired wheel angle this frame (rad)
+    actual: 0,       // smoothed wheel angle written to the controller (rad)
+    maxAngle: 0,     // speed-scaled max steering angle (rad)
+    speedFactor: 1   // scale applied to maxSteeringAngle by speed reduction
+};
+
+// 60-second telemetry recording started by the T key. Snapshots are pushed
+// each frame and dumped to a JSON download when the buffer fills, similar
+// to Trackmania's input recorder.
+const telemetry = {
+    recording: false,
+    startedAt: 0,
+    durationMs: 60_000,
+    samples: [],
+    sampleHz: 60,
+    lastSampleAt: 0,
+    lastDownloadedSize: 0
 };
 
 // Transmission state. Gear: -1 = R, 0 = N, 1..5 = forward gears.
@@ -3347,8 +3414,8 @@ const MAPS = {
         // Captured pose from the 5.5× session, rescaled by 2/5.5 so the
         // car still lands on the same on-asphalt point at the new scale.
         // Press P on-track if you want a tighter spawn.
-        spawnPos: { x: 123.89, y: 6.53, z: 152.21 },
-        spawnRot: { x: - 0.0072, y: 0.2846, z: - 0.0114, w: 0.9586 }
+        spawnPos: { x: 26.04, y: 26.09, z: 1219.19 },
+        spawnRot: { x: 0.0037, y: - 0.0176, z: 0.0121, w: - 0.9998 }
     }
 };
 let currentMapId = 'nurburgring';
@@ -3476,6 +3543,7 @@ async function init() {
 
     initSpeedometer();
     initStatsForNerds();
+    initJoystickMap();
     initTouchControls();
     initCarToast();
     initMinimap();
@@ -3529,6 +3597,13 @@ async function init() {
         if ( k === 'h' || k === 'H' ) {
 
             if ( physicsHelper ) physicsHelper.visible = ! physicsHelper.visible;
+
+        }
+
+        if ( k === 't' || k === 'T' ) {
+
+            if ( ! telemetry.recording ) startTelemetryRecording();
+            else stopTelemetryRecording( /* download */ true );
 
         }
 
@@ -4611,6 +4686,272 @@ function pushAndDrawMultiGraph( id, values ) {
 
 }
 
+// ---------------- joystick directional map ----------------
+//
+// Always-visible 110×110 widget pinned top-left. X axis = steering, Y axis =
+// throttle (up) / brake (down). Two dots overlap: a faint dot for the raw
+// merged input (pre-shape) and a bright dot for the shaped value that the
+// physics actually uses. Useful for spotting controller drift, asymmetric
+// inputs, and the steering curve's reshaping at a glance.
+
+const joystickMap = {
+    el: null,
+    canvas: null,
+    ctx: null,
+    subEl: null
+};
+
+function initJoystickMap() {
+
+    const wrap = document.createElement( 'div' );
+    wrap.id = 'joystickMap';
+    wrap.style.cssText = [
+        'position:absolute', 'top:10px', 'left:10px',
+        'padding:6px 7px 4px', 'background:rgba(0,0,0,0.55)',
+        'border:1px solid rgba(255,255,255,0.18)', 'border-radius:6px',
+        'color:#fff', 'font:10px Monospace', 'z-index:3',
+        'box-shadow:0 4px 16px rgba(0,0,0,0.45)',
+        'user-select:none', 'pointer-events:none',
+        'display:flex', 'flex-direction:column', 'align-items:center'
+    ].join( ';' );
+
+    const label = document.createElement( 'div' );
+    label.textContent = 'INPUT';
+    label.style.cssText = 'letter-spacing:1.5px;opacity:0.7;margin-bottom:3px;font-size:9px';
+    wrap.appendChild( label );
+
+    const canvas = document.createElement( 'canvas' );
+    canvas.width = 108;
+    canvas.height = 108;
+    canvas.style.cssText = 'display:block;background:rgba(255,255,255,0.04);border-radius:4px';
+    wrap.appendChild( canvas );
+
+    const sub = document.createElement( 'div' );
+    sub.style.cssText = 'margin-top:3px;font-size:9px;opacity:0.7;font-variant-numeric:tabular-nums;letter-spacing:0.3px';
+    sub.textContent = 'S 0.00 · T 0.00';
+    wrap.appendChild( sub );
+
+    document.body.appendChild( wrap );
+    joystickMap.el = wrap;
+    joystickMap.canvas = canvas;
+    joystickMap.ctx = canvas.getContext( '2d' );
+    joystickMap.subEl = sub;
+
+}
+
+function renderJoystickMap() {
+
+    if ( ! joystickMap.ctx ) return;
+    const ctx = joystickMap.ctx;
+    const w = joystickMap.canvas.width;
+    const h = joystickMap.canvas.height;
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const r = w * 0.5 - 6;
+
+    ctx.clearRect( 0, 0, w, h );
+
+    // Crosshair axes.
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo( 0, cy ); ctx.lineTo( w, cy );
+    ctx.moveTo( cx, 0 ); ctx.lineTo( cx, h );
+    ctx.stroke();
+
+    // Outer ring + deadzone ring (matches steeringCfg.deadzone visually).
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.beginPath();
+    ctx.arc( cx, cy, r, 0, Math.PI * 2 );
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.beginPath();
+    ctx.arc( cx, cy, r * steeringCfg.deadzone, 0, Math.PI * 2 );
+    ctx.stroke();
+
+    // Vertical axis is throttle (up) and brake (down). We map their
+    // difference so the dot sits at the dominant pedal — brake-only goes
+    // down, throttle-only goes up, both pressed cancels toward center.
+    const sx = cx + input.steer * r;
+    const verticalAxis = input.throttle - input.brake;
+    const sy = cy - verticalAxis * r;
+
+    // Raw merged input (pre-shape) — faint dot. When the wheel curve is
+    // softening the input, this dot sits further from center than the
+    // bright one, making the curve visible at a glance.
+    const rx = cx + input.steerRaw * r;
+    ctx.fillStyle = 'rgba(255,255,255,0.30)';
+    ctx.beginPath();
+    ctx.arc( rx, sy, 3, 0, Math.PI * 2 );
+    ctx.fill();
+
+    // Shaped input — bright dot + trail from center.
+    ctx.strokeStyle = 'rgba(255,203,71,0.45)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo( cx, cy );
+    ctx.lineTo( sx, sy );
+    ctx.stroke();
+    ctx.fillStyle = '#FFCB47';
+    ctx.beginPath();
+    ctx.arc( sx, sy, 4.5, 0, Math.PI * 2 );
+    ctx.fill();
+
+    // Status badges — TC (red) when traction control is biting, HB (cyan)
+    // when handbrake is pulled, REC + countdown when telemetry is recording.
+    ctx.font = 'bold 9px Monospace';
+    if ( drivetrain.tc.engaged ) {
+
+        ctx.fillStyle = 'rgba(255,90,90,0.90)';
+        ctx.textAlign = 'right';
+        ctx.fillText( 'TC', w - 4, 11 );
+
+    }
+    if ( input.handbrake > 0.5 ) {
+
+        ctx.fillStyle = 'rgba(120,200,255,0.90)';
+        ctx.textAlign = 'left';
+        ctx.fillText( 'HB', 4, 11 );
+
+    }
+    if ( telemetry.recording ) {
+
+        const remaining = Math.max( 0, ( telemetry.startedAt + telemetry.durationMs - performance.now() ) / 1000 );
+        ctx.fillStyle = 'rgba(255,90,90,0.95)';
+        ctx.textAlign = 'left';
+        ctx.fillText( `● REC ${ remaining.toFixed( 0 ) }s`, 4, h - 4 );
+
+    }
+
+    if ( joystickMap.subEl ) {
+
+        joystickMap.subEl.textContent = `S ${ input.steerRaw.toFixed( 2 ) } · T ${ verticalAxis.toFixed( 2 ) }`;
+
+    }
+
+}
+
+// ---------------- T-key telemetry recorder (Trackmania-style) ----------------
+//
+// Press T to capture 60 s of per-frame input + output vectors at ~60 Hz.
+// At the end (or on second T press) the buffer is downloaded as a single
+// JSON file with header metadata + a samples array. Designed for offline
+// inspection / replay tooling, not for live broadcast.
+
+function startTelemetryRecording() {
+
+    telemetry.recording = true;
+    telemetry.startedAt = performance.now();
+    telemetry.lastSampleAt = 0;
+    telemetry.samples = [];
+    console.log( '[telemetry] recording started — 60s' );
+
+}
+
+function stopTelemetryRecording( download ) {
+
+    if ( ! telemetry.recording ) return;
+    telemetry.recording = false;
+    const sampleCount = telemetry.samples.length;
+    if ( ! download ) {
+
+        console.log( `[telemetry] aborted (${ sampleCount } samples discarded)` );
+        telemetry.samples = [];
+        return;
+
+    }
+    const elapsedMs = performance.now() - telemetry.startedAt;
+    const payload = {
+        format: 'race_in_progress.telemetry.v1',
+        recordedAt: new Date().toISOString(),
+        car: currentCar.name,
+        driveType: currentCar.driveType,
+        map: currentMapId,
+        durationMs: Math.round( elapsedMs ),
+        sampleCount,
+        steeringCfg: { ...steeringCfg },
+        tcCfg: { ...tcCfg },
+        samples: telemetry.samples
+    };
+    const blob = new Blob( [ JSON.stringify( payload ) ], { type: 'application/json' } );
+    const url = URL.createObjectURL( blob );
+    const a = document.createElement( 'a' );
+    const stamp = new Date().toISOString().replace( /[:.]/g, '-' );
+    a.href = url;
+    a.download = `telemetry_${ currentCar.name.replace( /\s+/g, '' ) }_${ stamp }.json`;
+    document.body.appendChild( a );
+    a.click();
+    document.body.removeChild( a );
+    setTimeout( () => URL.revokeObjectURL( url ), 1000 );
+    telemetry.lastDownloadedSize = blob.size;
+    console.log( `[telemetry] recorded ${ sampleCount } samples (${ ( elapsedMs / 1000 ).toFixed( 1 ) } s, ${ ( blob.size / 1024 ).toFixed( 1 ) } KiB) → downloaded` );
+    telemetry.samples = [];
+
+}
+
+function captureTelemetrySample( now ) {
+
+    if ( ! telemetry.recording || ! chassis || ! vehicleController ) return;
+
+    // Auto-stop at the 60 s mark.
+    if ( now - telemetry.startedAt >= telemetry.durationMs ) {
+
+        stopTelemetryRecording( true );
+        return;
+
+    }
+
+    // Throttle to the nominal sample rate so we don't bloat the buffer on
+    // high-refresh displays. At 60 Hz this still gives ~3600 samples / minute.
+    const minIntervalMs = 1000 / telemetry.sampleHz;
+    if ( telemetry.lastSampleAt && now - telemetry.lastSampleAt < minIntervalMs ) return;
+    telemetry.lastSampleAt = now;
+
+    const t = chassis.translation();
+    const v = chassis.linvel();
+    const av = chassis.angvel();
+    const q = chassis.rotation();
+    const wheels = [];
+    for ( let i = 0; i < 4; i ++ ) {
+
+        wheels.push( {
+            slipR: tires.slipRatio[ i ],
+            slipA: tires.slipAngle[ i ],
+            fwdI: vehicleController.wheelForwardImpulse( i ),
+            sideI: vehicleController.wheelSideImpulse( i ),
+            engineF: vehicleController.wheelEngineForce( i ),
+            brake: vehicleController.wheelBrake( i ),
+            contact: vehicleController.wheelIsInContact( i ) ? 1 : 0
+        } );
+
+    }
+    telemetry.samples.push( {
+        t: Math.round( now - telemetry.startedAt ),
+        input: {
+            steerRaw: input.steerRaw,
+            steer: input.steer,
+            throttle: input.throttle,
+            brake: input.brake,
+            handbrake: input.handbrake,
+            reverse: input.reverseEngaged ? 1 : 0
+        },
+        output: {
+            steerTarget: steeringTelemetry.target,
+            steerActual: steeringTelemetry.actual,
+            speedMs: vehicleController.currentVehicleSpeed(),
+            gear: transmission.gear,
+            rpm: engine.rpm,
+            tcCutPct: drivetrain.tc.cutPct,
+            pos: [ t.x, t.y, t.z ],
+            rot: [ q.x, q.y, q.z, q.w ],
+            vel: [ v.x, v.y, v.z ],
+            angVel: [ av.x, av.y, av.z ],
+            wheels
+        }
+    } );
+
+}
+
 function initStatsForNerds() {
 
     // Toggle button — small pill below the three.js Stats overlay. Top is
@@ -4661,9 +5002,36 @@ function initStatsForNerds() {
     const drive = _sSection( panel, 'DRIVER INPUT' );
     _sStat( drive, 'throttle', 's_throttle' );
     _sStat( drive, 'brake', 's_brake' );
-    _sStat( drive, 'steer', 's_steer' );
+    _sStat( drive, 'steer (raw)', 's_steer_raw', 'pre-curve merged input from keyboard / gamepad / touch' );
+    _sStat( drive, 'steer (shaped)', 's_steer', 'after deadzone + curve — drives the wheel target' );
+    _sStat( drive, 'deadzone state', 's_deadzone', 'IN means raw input is inside the deadzone and snapped to 0' );
     _sStat( drive, 'handbrake', 's_handbrake' );
     _sStat( drive, 'reverse engaged', 's_reverse' );
+
+    const steer = _sSection( panel, 'STEERING PIPELINE' );
+    _sStat( steer, 'max angle', 's_maxAngle', 'speed-scaled mechanical max steering angle' );
+    _sStat( steer, 'speed factor', 's_speedFactor', '1.0 at standstill, drops to minFactor at vReduceMax' );
+    _sStat( steer, 'target angle', 's_steerTarget', 'desired wheel angle this frame' );
+    _sStat( steer, 'actual angle', 's_steerActual', 'smoothed angle written to the controller' );
+    _sStat( steer, 'residual drift', 's_residual', 'absolute wheel offset when input is centered (should be ≈0)' );
+    _sStat( steer, 'curve · dz', 's_curveCfg', 'live curve exponent · deadzone' );
+    _sMultiGraph( panel, 'steer', 'g_steer', 280, 36,
+        [ '#FFFFFFAA', '#FFCB47', '#7BD37F' ],
+        [ 'raw', 'shaped', 'actual' ],
+        - 1.1, 1.1 );
+
+    const tc = _sSection( panel, 'TRACTION CONTROL' );
+    _sStat( tc, 'status', 's_tc_status', 'ON / OFF / ENGAGED — engaged is sticky for ~120ms' );
+    _sStat( tc, 'cut %', 's_tc_cut', 'largest fractional torque cut across driven wheels this frame' );
+    _sStat( tc, 'events', 's_tc_count', 'number of distinct TC engagements since session start' );
+    _sStat( tc, 'thresholds', 's_tc_cfg', 'slip threshold · cut gain · min mult' );
+    _sGraph( panel, 'TC cut %', 'g_tc', 280, 28, '#FF6464', 0, 1 );
+
+    const rec = _sSection( panel, 'TELEMETRY RECORDER (T)' );
+    _sStat( rec, 'state', 's_rec_state' );
+    _sStat( rec, 'remaining', 's_rec_remaining' );
+    _sStat( rec, 'samples', 's_rec_samples' );
+    _sStat( rec, 'last dump', 's_rec_last' );
 
     const drv = _sSection( panel, 'DRIVETRAIN' );
     _sStat( drv, 'mode', 's_mode' );
@@ -4764,15 +5132,66 @@ function updateStatsForNerds( speed ) {
     // recent history rather than starting from a flat line.
     pushAndDrawGraph( 'g_rpm', engine.rpm );
     pushAndDrawGraph( 'g_speed', Math.abs( speed ) * 3.6 );
+    // Steering pipeline + TC traces always log so the graph carries history.
+    // Normalize the actual wheel angle by the per-car mechanical max so
+    // raw / shaped / actual all share the same -1..+1 axis.
+    const carMax = currentCar ? currentCar.maxSteeringAngle : 1;
+    pushAndDrawMultiGraph( 'g_steer', [
+        input.steerRaw,
+        input.steer,
+        carMax > 0 ? steeringTelemetry.actual / carMax : 0
+    ] );
+    pushAndDrawGraph( 'g_tc', drivetrain.tc.cutPct );
     updateTireWidget();
 
     if ( ! statsForNerds.enabled || ! chassis ) return;
 
     _sset( 's_throttle', input.throttle.toFixed( 2 ) );
     _sset( 's_brake', input.brake.toFixed( 2 ) );
-    _sset( 's_steer', input.steer.toFixed( 2 ) );
+    _sset( 's_steer_raw', input.steerRaw.toFixed( 3 ) );
+    _sset( 's_steer', input.steer.toFixed( 3 ) );
+    const inDeadzone = Math.abs( input.steerRaw ) > 0 && Math.abs( input.steerRaw ) <= steeringCfg.deadzone;
+    _sset( 's_deadzone', inDeadzone ? 'IN (snapped)' : ( input.steerRaw === 0 ? '—' : 'out' ) );
     _sset( 's_handbrake', input.handbrake.toFixed( 2 ) );
     _sset( 's_reverse', input.reverseEngaged ? 'YES' : 'no' );
+
+    // Steering pipeline diagnostics.
+    _sset( 's_maxAngle', `${ ( steeringTelemetry.maxAngle * 180 / Math.PI ).toFixed( 1 ) }°` );
+    _sset( 's_speedFactor', steeringTelemetry.speedFactor.toFixed( 2 ) );
+    _sset( 's_steerTarget', `${ ( steeringTelemetry.target * 180 / Math.PI ).toFixed( 1 ) }°` );
+    _sset( 's_steerActual', `${ ( steeringTelemetry.actual * 180 / Math.PI ).toFixed( 1 ) }°` );
+    // Residual drift: how far the wheel is from 0 when the input is centered.
+    // Anything below ~0.05° is effectively zero; we colour the value if it lingers.
+    const residualDeg = input.steerRaw === 0 ? Math.abs( steeringTelemetry.actual * 180 / Math.PI ) : 0;
+    _sset( 's_residual', input.steerRaw === 0 ? `${ residualDeg.toFixed( 3 ) }°` : '— (input active)' );
+    _sset( 's_curveCfg', `${ steeringCfg.curveExponent.toFixed( 2 ) } · ${ steeringCfg.deadzone.toFixed( 3 ) }` );
+
+    // Traction control diagnostics.
+    const tcStatus = ! tcCfg.enabled ? 'OFF'
+        : drivetrain.tc.engaged ? 'ENGAGED'
+        : 'armed';
+    _sset( 's_tc_status', tcStatus );
+    _sset( 's_tc_cut', `${ ( drivetrain.tc.cutPct * 100 ).toFixed( 1 ) }%` );
+    _sset( 's_tc_count', String( drivetrain.tc.eventCount ) );
+    _sset( 's_tc_cfg', `${ tcCfg.slipThreshold.toFixed( 2 ) } · ${ tcCfg.cutGain.toFixed( 1 ) } · ${ tcCfg.minMult.toFixed( 2 ) }` );
+
+    // Telemetry recorder.
+    if ( telemetry.recording ) {
+
+        const remaining = Math.max( 0, ( telemetry.startedAt + telemetry.durationMs - performance.now() ) / 1000 );
+        _sset( 's_rec_state', '● RECORDING' );
+        _sset( 's_rec_remaining', `${ remaining.toFixed( 1 ) } s` );
+
+    } else {
+
+        _sset( 's_rec_state', 'idle (press T)' );
+        _sset( 's_rec_remaining', '—' );
+
+    }
+    _sset( 's_rec_samples', telemetry.samples.length.toString() );
+    _sset( 's_rec_last', telemetry.lastDownloadedSize > 0
+        ? `${ ( telemetry.lastDownloadedSize / 1024 ).toFixed( 1 ) } KiB`
+        : '—' );
 
     _sset( 's_mode', transmission.mode.toUpperCase() );
     _sset( 's_layout', currentCar.driveType || 'FWD' );
@@ -5144,6 +5563,47 @@ function applyDeadzone( v, dz ) {
 
 }
 
+// Shape the merged steer input through deadzone → curve. Returns a value in
+// [-1, 1]. The deadzone snaps small residual values (controller drift,
+// floating-point noise from max-merging across sources) to exactly 0, fixing
+// the "driving straight feels like it's drifting" problem visible on the
+// joystick-map widget. The exponent flattens the response near center so
+// fine corrections at speed aren't twitchy, while still reaching ±1 at full
+// stick deflection.
+function shapeSteer( raw ) {
+
+    const a = Math.abs( raw );
+    if ( a <= steeringCfg.deadzone ) return 0;
+    const remapped = ( a - steeringCfg.deadzone ) / ( 1 - steeringCfg.deadzone );
+    const curved = Math.pow( remapped, steeringCfg.curveExponent );
+    return Math.sign( raw ) * curved;
+
+}
+
+// Scale the per-car mechanical maximum steering angle by speed so the car
+// can't be ripped sideways at 200 km/h. Returns [minFactor, 1] — at
+// standstill we get full lock, then it ramps down to minFactor at vReduceMax.
+function steeringSpeedFactor( speed ) {
+
+    const t = Math.min( 1, Math.abs( speed ) / steeringCfg.vReduceMax );
+    return THREE.MathUtils.lerp( 1, steeringCfg.minFactor, t );
+
+}
+
+// Per-driven-wheel traction-control multiplier. Returns 1.0 when slip is in
+// the safe range, then ramps down toward `minMult` as slip exceeds the
+// threshold. Side-effect: bumps the drivetrain.tc telemetry so the stats
+// panel can show when TC engaged.
+function tractionCutFactor( slipRatio, speed ) {
+
+    if ( ! tcCfg.enabled ) return 1;
+    if ( Math.abs( speed ) < tcCfg.minActiveSpeed ) return 1;
+    const excess = Math.abs( slipRatio ) - tcCfg.slipThreshold;
+    if ( excess <= 0 ) return 1;
+    return Math.max( tcCfg.minMult, 1 - excess * tcCfg.cutGain );
+
+}
+
 function pollGamepad() {
 
     if ( gamepad.index < 0 ) return null;
@@ -5234,7 +5694,13 @@ function updateInput( dt ) {
 
     }
 
-    input.steer = steer;
+    // Capture the raw (pre-shape) merged steer so the joystick-map widget +
+    // telemetry can show what the driver actually requested. The curve below
+    // shapes the steer that the *physics* uses — small inputs become smaller
+    // (softer near center) and a 4.5% deadzone snaps residual drift to 0 so
+    // the car tracks straight when no one is touching the wheel.
+    input.steerRaw = THREE.MathUtils.clamp( steer, - 1, 1 );
+    input.steer = shapeSteer( input.steerRaw );
     input.throttle = throttle;
     input.brake = brake;
     input.handbrake = handbrake;
@@ -5437,9 +5903,35 @@ function applyVehicleForces( speed, dt ) {
     // wheel (even split, simple center "diff").
     const driven = drivenWheelIndices( currentCar.driveType );
     const perDriven = ( 2 * engineForce ) / driven.length;
+    // Traction control: trim per-wheel torque whenever its slip ratio is
+    // past the peak-grip threshold. Track the largest cut for the stats panel
+    // and latch an "engaged" indicator for ~120ms so the UI light is readable.
+    let frameMaxCut = 0;
     for ( let i = 0; i < 4; i ++ ) {
 
-        vehicleController.setWheelEngineForce( i, driven.indexOf( i ) >= 0 ? perDriven : 0 );
+        const isDriven = driven.indexOf( i ) >= 0;
+        if ( ! isDriven ) {
+
+            vehicleController.setWheelEngineForce( i, 0 );
+            continue;
+
+        }
+        const tcMult = tractionCutFactor( tires.slipRatio[ i ], speed );
+        const cut = 1 - tcMult;
+        if ( cut > frameMaxCut ) frameMaxCut = cut;
+        vehicleController.setWheelEngineForce( i, perDriven * tcMult );
+
+    }
+    drivetrain.tc.cutPct = frameMaxCut;
+    if ( frameMaxCut > 0.02 ) {
+
+        if ( ! drivetrain.tc.engaged ) drivetrain.tc.eventCount += 1;
+        drivetrain.tc.engaged = true;
+        drivetrain.tc.engagedUntil = performance.now() + 120;
+
+    } else if ( performance.now() > drivetrain.tc.engagedUntil ) {
+
+        drivetrain.tc.engaged = false;
 
     }
 
@@ -5465,16 +5957,33 @@ function applyVehicleForces( speed, dt ) {
     vehicleController.setWheelBrake( 2, Math.max( serviceBrake, handbrake ) );
     vehicleController.setWheelBrake( 3, Math.max( serviceBrake, handbrake ) );
 
-    // STEERING — smoothed. Max angle per car. Toe is baked in as the *resting*
-    // steering angle, and driver input lerps an offset on top.
+    // STEERING — non-linear curve (in shapeSteer), speed-scaled mechanical
+    // max, and dt-aware smoothing. Toe stays baked in as the *resting*
+    // steering angle; driver input lerps an offset on top.
     const toe = currentCar.toeDeg || [ 0, 0, 0, 0 ];
     const toeFL = toe[ 0 ] * _DEG;
     const toeFR = toe[ 1 ] * _DEG;
     // Read current driver-steering offset by subtracting the toe contribution
     // off the wheel. Both front wheels share the same driver offset.
     const currentOffset = vehicleController.wheelSteering( 0 ) - toeFL;
-    const target = currentCar.maxSteeringAngle * input.steer;
-    const steering = THREE.MathUtils.lerp( currentOffset, target, 0.25 );
+    const speedFactor = steeringSpeedFactor( speed );
+    const maxAngle = currentCar.maxSteeringAngle * speedFactor;
+    const target = maxAngle * input.steer;
+    // Return-to-center is faster than steer-in so the wheels actually settle
+    // when input goes to 0 instead of asymptotically lingering off-axis.
+    const returning = Math.abs( target ) < Math.abs( currentOffset );
+    const rate = returning ? steeringCfg.smoothReturnRate : steeringCfg.smoothInRate;
+    const alpha = 1 - Math.exp( - rate * dt );
+    let steering = THREE.MathUtils.lerp( currentOffset, target, alpha );
+    // Snap to zero when the input is centered and we're inside the
+    // numerical noise floor. Catches the long tail of the exponential decay
+    // — without this, the wheels never quite reach 0 and the chassis drifts.
+    if ( input.steer === 0 && Math.abs( steering ) < steeringCfg.zeroSnapRad ) steering = 0;
+    // Telemetry for the joystick map + stats panel.
+    steeringTelemetry.target = target;
+    steeringTelemetry.actual = steering;
+    steeringTelemetry.maxAngle = maxAngle;
+    steeringTelemetry.speedFactor = speedFactor;
     vehicleController.setWheelSteering( 0, toeFL + steering );
     vehicleController.setWheelSteering( 1, toeFR + steering );
 
@@ -5626,6 +6135,8 @@ function animate( time ) {
 
         statsForNerds.lastDelta = delta;
         updateStatsForNerds( speed );
+        renderJoystickMap();
+        captureTelemetrySample( performance.now() );
 
         updateAudio( delta );
 
