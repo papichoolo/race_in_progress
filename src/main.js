@@ -225,13 +225,38 @@ function applyCarConfig( car, skipVisuals ) {
     if ( transmission.gear > car.gearRatios.length ) transmission.gear = car.gearRatios.length;
 
     // Mass — Rapier setAdditionalMass adds to the baseline (lightest car).
+    // if ( chassis ) {
+
+    //     const baselineMass = Math.min( ...CARS.map( c => c.mass ) );
+    //     const extra = Math.max( 0, car.mass - baselineMass );
+    //     chassis.setAdditionalMass( extra, true );
+
+    // }
+    
+    // Mass + lowered center of mass. The chassis box is 2×1×4 centered at y=0,
+    // but the wheels connect near y=-0.3, so the default CoM sits above the
+    // suspension. Dropping the CoM below center kills the wheelie/pitch-up
+    // under acceleration.
     if ( chassis ) {
 
-        const baselineMass = Math.min( ...CARS.map( c => c.mass ) );
-        const extra = Math.max( 0, car.mass - baselineMass );
-        chassis.setAdditionalMass( extra, true );
+        const totalMass = car.mass;
+
+        // Solid-box inertia (1/12)·m·(a²+b²) per axis. Box = 2(x)×1(y)×4(z).
+        const w = 2, h = 1, d = 4;
+        const ix = ( 1 / 12 ) * totalMass * ( h * h + d * d );
+        const iy = ( 1 / 12 ) * totalMass * ( w * w + d * d );
+        const iz = ( 1 / 12 ) * totalMass * ( w * w + h * h );
+
+        chassis.setAdditionalMassProperties(
+            totalMass,
+            { x: 0, y: - 0.5, z: 0 },          // CoM dropped 0.5m below center
+            { x: ix, y: iy, z: iz },
+            { x: 0, y: 0, z: 0, w: 1 },
+            true
+        );
 
     }
+    
 
     // Per-wheel suspension + friction + connection-point Y. Wheels keep their
     // X/Z positions; we only retune what the wheel/spring does.
