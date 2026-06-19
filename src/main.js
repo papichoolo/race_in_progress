@@ -1657,8 +1657,8 @@ const MAPS = {
         // Captured pose from the 5.5× session, rescaled by 2/5.5 so the
         // car still lands on the same on-asphalt point at the new scale.
         // Press P on-track if you want a tighter spawn.
-        spawnPos: { x: - 110.8, y: - 1.92, z: - 241.8 },
-        spawnRot: { x: - 0.0047, y: 0.2895, z: 0.0439, w: 0.9561 }
+        spawnPos: { x: 123.89, y: 6.53, z: 152.21 },
+        spawnRot: { x: - 0.0072, y: 0.2846, z: - 0.0114, w: 0.9586 }
     }
 };
 let currentMapId = 'nurburgring';
