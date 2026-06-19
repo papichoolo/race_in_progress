@@ -1613,6 +1613,22 @@ function _isCarLocked() {
 
 }
 
+// Solid cars during race-active states; ghost cars during lobby /
+// finished so people can cruise around without bumping each other.
+function _isCollidableRaceState() {
+
+    const s = multiplayer.raceState;
+    return s === 'ready_check' || s === 'countdown' || s === 'racing';
+
+}
+
+function _applyRaceModeToRemotes() {
+
+    const on = _isCollidableRaceState();
+    for ( const rc of multiplayer.remotes.values() ) rc.setCollidable( on );
+
+}
+
 function _localPlayerName() {
 
     let n = localStorage.getItem( 'playerName' );
@@ -1745,6 +1761,7 @@ class RemoteCar {
         const roof = new THREE.Mesh( new THREE.BoxGeometry( 1.6, 0.6, 2 ), roofMat );
         roof.position.set( 0, 0.7, - 0.2 );
         this.group.add( roof );
+        this.roofMat = roofMat;
 
         const wheelMat = new THREE.MeshLambertMaterial( {
             color: 0x080808,
@@ -1752,6 +1769,7 @@ class RemoteCar {
             opacity: 0.7,
             depthWrite: false
         } );
+        this.wheelMat = wheelMat;
         this.wheels = [];
         const wheelDX = 1.0, wheelDY = - 0.5, wheelDZ = 1.4;
         const wheelPositions = [
@@ -1779,6 +1797,52 @@ class RemoteCar {
         // sits at (0,0,0) — below the Nordschleife terrain — and you see
         // nothing until the first interpolated frame lands.
         this.group.visible = false;
+
+        // Kinematic Rapier body shaped like the chassis collider. Disabled
+        // by default (ghost cars), turned on when race state goes
+        // ready_check / countdown / racing so our chassis can bounce off
+        // remote cars. Asymmetric — they don't feel our hits locally
+        // because each peer owns its own physics; the bounce is purely
+        // visual on each side.
+        this._buildPhysics();
+        this._collidable = false;
+
+    }
+
+    _buildPhysics() {
+
+        if ( ! physics || ! physics.RAPIER || ! physics.world ) return;
+        const RAPIER = physics.RAPIER;
+        const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased();
+        bodyDesc.setTranslation( 0, - 10000, 0 ); // park far below world until first snap
+        this.body = physics.world.createRigidBody( bodyDesc );
+        // chassis box is 2 × 1 × 4 (full extents) → half-extents 1 / 0.5 / 2
+        const colliderDesc = RAPIER.ColliderDesc.cuboid( 1, 0.5, 2 );
+        this.collider = physics.world.createCollider( colliderDesc, this.body );
+        this.collider.setEnabled( false );
+
+    }
+
+    setCollidable( on ) {
+
+        on = !! on;
+        if ( this._collidable === on ) return;
+        this._collidable = on;
+        if ( this.collider ) this.collider.setEnabled( on );
+
+        // Visual swap: opaque + writes depth when solid, translucent + no
+        // depth write when ghost. The name sprite uses depthTest:false and
+        // stays unchanged.
+        const opacity = on ? 1.0 : 0.6;
+        for ( const o of [ this.bodyMat, this.roofMat, this.wheelMat ] ) {
+
+            if ( ! o ) continue;
+            o.transparent = ! on;
+            o.opacity = opacity;
+            o.depthWrite = on;
+            o.needsUpdate = true;
+
+        }
 
     }
 
@@ -1899,6 +1963,17 @@ class RemoteCar {
         const angularDelta = ( speed / 0.35 ) * dt;
         for ( const w of this.wheels ) w.rotation.x -= angularDelta;
 
+        // When solid, drive the kinematic body to the rendered pose so the
+        // local chassis can collide with it.
+        if ( this.body && this._collidable && this.group.visible ) {
+
+            const p = this.group.position;
+            const q = this.group.quaternion;
+            this.body.setNextKinematicTranslation( { x: p.x, y: p.y, z: p.z } );
+            this.body.setNextKinematicRotation( { x: q.x, y: q.y, z: q.z, w: q.w } );
+
+        }
+
     }
 
     _apply( snap ) {
@@ -1922,6 +1997,13 @@ class RemoteCar {
             }
 
         } );
+        if ( this.body && physics && physics.world ) {
+
+            physics.world.removeRigidBody( this.body );
+            this.body = null;
+            this.collider = null;
+
+        }
 
     }
 
@@ -2009,7 +2091,9 @@ function _hookRoomCallbacks( room ) {
         // would arrive before we have a car to apply them to.
         if ( ! multiplayer.remotes.has( peerId ) ) {
 
-            multiplayer.remotes.set( peerId, new RemoteCar( peerId, multiplayer.metaByPeer.get( peerId ) ) );
+            const rc = new RemoteCar( peerId, multiplayer.metaByPeer.get( peerId ) );
+            rc.setCollidable( _isCollidableRaceState() );
+            multiplayer.remotes.set( peerId, rc );
 
         }
         _renderMultiplayerUI();
@@ -2037,6 +2121,7 @@ function _hookRoomCallbacks( room ) {
         if ( ! rc ) {
 
             rc = new RemoteCar( peerId, data );
+            rc.setCollidable( _isCollidableRaceState() );
             multiplayer.remotes.set( peerId, rc );
 
         } else {
@@ -2067,6 +2152,7 @@ function _hookRoomCallbacks( room ) {
             // and the meta sent on peerJoin). Spawn with cached meta if any,
             // otherwise placeholder until meta lands.
             rc = new RemoteCar( peerId, multiplayer.metaByPeer.get( peerId ) );
+            rc.setCollidable( _isCollidableRaceState() );
             multiplayer.remotes.set( peerId, rc );
             _renderMultiplayerUI();
 
@@ -2104,6 +2190,7 @@ function _hookRoomCallbacks( room ) {
                 multiplayer.raceWinner = peerId;
                 multiplayer.raceWinnerName = ( multiplayer.metaByPeer.get( peerId ) || {} ).name || peerId.slice( 0, 6 );
                 multiplayer.raceState = 'finished';
+                _applyRaceModeToRemotes();
                 _announceWinner( multiplayer.raceWinnerName + ' wins!' );
                 _renderMultiplayerUI();
 
@@ -2123,6 +2210,7 @@ function _enterReadyCheck() {
     multiplayer.raceWinner = null;
     multiplayer.raceWinnerName = '';
     lapTimerResetCurrent();
+    _applyRaceModeToRemotes();
     _renderMultiplayerUI();
 
 }
@@ -2220,6 +2308,7 @@ function _onLocalLapCompleteForRace() {
     multiplayer.raceWinner = 'self';
     multiplayer.raceWinnerName = multiplayer.playerName + ' (you)';
     multiplayer.raceState = 'finished';
+    _applyRaceModeToRemotes();
     multiplayer.room.sendRace( { type: 'finished' } );
     _announceWinner( 'you win!' );
     _renderMultiplayerUI();
