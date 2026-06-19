@@ -11,6 +11,7 @@ let physics, physicsHelper, controls;
 let car, chassis, wheels, vehicleController;
 let clock;
 let fpsLabel, posLabel;
+let lapTimer;
 let track, trackBody, sunLight, sunTarget;
 let speedoEl, speedoNumEl, speedoGearEl, speedoRpmFillEl, speedoModeEl, speedoControllerEl;
 
@@ -996,7 +997,7 @@ function initMinimap() {
     // matches the other overlay styling.
     const wrap = document.createElement( 'div' );
     wrap.style.cssText = [
-        'position:absolute', 'bottom:46px', 'left:10px',
+        'position:absolute', 'bottom:82px', 'left:10px',
         'width:200px', 'height:200px',
         'background:rgba(0,0,0,0.55)', 'border:1px solid rgba(255,255,255,0.22)',
         'border-radius:8px', 'overflow:hidden', 'z-index:3',
@@ -1095,6 +1096,453 @@ function renderMinimap() {
     scene.background = null;
     minimap.renderer.render( scene, minimap.camera );
     scene.background = bg;
+
+}
+
+// ---------------- lap timer ----------------
+//
+// Single-row pill at bottom-left (above the FPS bar) showing the running lap
+// time. Click to drop UP a panel of past laps + average. Past laps persist in
+// localStorage, keyed per map (lapTimes_v1_<mapId>).
+//
+// IMPORTANT: the timer only ARMS on a real user input — keyboard, gamepad, or
+// touch — because the chassis can roll on its own under gravity on inclines
+// and we don't want a phantom lap starting then. Once armed, it runs
+// continuously until completeLap() is called (which records the split and
+// restarts), or until the player presses R (which re-arms it from zero).
+//
+// To finish a lap you need a start/finish line check. That part is map-
+// specific so I left it to you — see the END of this file for the hook
+// (completeLap is exposed on window so you can also test from devtools).
+
+const LAP_STORAGE_PREFIX = 'lapTimes_v1_';
+
+function _fmtLap( ms ) {
+
+    if ( ! isFinite( ms ) || ms < 0 ) return '—';
+    const m = Math.floor( ms / 60000 );
+    const s = Math.floor( ( ms % 60000 ) / 1000 );
+    const cs = Math.floor( ( ms % 1000 ) / 10 );
+    return `${ m }:${ String( s ).padStart( 2, '0' ) }.${ String( cs ).padStart( 2, '0' ) }`;
+
+}
+
+function initLapTimer() {
+
+    lapTimer = {
+        armed: false,    // true once a real input has been seen
+        running: false,  // ticking
+        startTime: 0,    // performance.now() reference
+        elapsed: 0,
+        laps: [],        // [{ time, ts }] — newest pushed at end
+        expanded: false,
+        // DOM
+        root: null, bar: null, timeEl: null, arrowEl: null,
+        panel: null, listEl: null, statsEl: null
+    };
+
+    // Anchor + drop-up host. Positioned right above the FPS pill (which is
+    // at bottom:10px with ~24px height + a small gap).
+    const root = document.createElement( 'div' );
+    root.style.cssText = [
+        'position:absolute', 'bottom:46px', 'left:10px',
+        'z-index:2', 'font:12px Monospace', 'color:#fff',
+        'user-select:none'
+    ].join( ';' );
+
+    // Collapsed bar — single small timeline: "LAP · 0:00.00 · ▲"
+    const bar = document.createElement( 'div' );
+    bar.style.cssText = [
+        'display:flex', 'align-items:center', 'gap:8px',
+        'padding:4px 10px', 'background:rgba(0,0,0,0.55)',
+        'border-radius:4px', 'cursor:pointer'
+    ].join( ';' );
+
+    const labelEl = document.createElement( 'span' );
+    labelEl.textContent = 'LAP';
+    labelEl.style.cssText = 'opacity:0.6;letter-spacing:1px';
+
+    const timeEl = document.createElement( 'span' );
+    timeEl.textContent = '0:00.00';
+    timeEl.style.cssText = 'color:#FFCB47;font-weight:bold;min-width:64px;text-align:left';
+
+    const arrowEl = document.createElement( 'span' );
+    arrowEl.textContent = '▲';
+    arrowEl.style.cssText = 'margin-left:4px;opacity:0.6;font-size:10px';
+
+    bar.append( labelEl, timeEl, arrowEl );
+
+    // Drop-up panel — grows upward over the minimap area.
+    const panel = document.createElement( 'div' );
+    panel.style.cssText = [
+        'display:none', 'position:absolute',
+        'bottom:100%', 'left:0', 'margin-bottom:4px',
+        'min-width:200px', 'padding:6px 10px',
+        'background:rgba(0,0,0,0.78)',
+        'border:1px solid rgba(255,255,255,0.15)',
+        'border-radius:4px', 'font-size:11px',
+        'max-height:240px', 'overflow-y:auto',
+        'box-shadow:0 4px 12px rgba(0,0,0,0.5)'
+    ].join( ';' );
+
+    // Header: best / count / avg + clear button.
+    const statsEl = document.createElement( 'div' );
+    statsEl.style.cssText = [
+        'display:flex', 'justify-content:space-between', 'align-items:center',
+        'gap:8px', 'margin-bottom:4px', 'padding-bottom:4px',
+        'border-bottom:1px solid rgba(255,255,255,0.12)'
+    ].join( ';' );
+
+    const clearBtn = document.createElement( 'span' );
+    clearBtn.textContent = 'clear';
+    clearBtn.style.cssText = 'cursor:pointer;opacity:0.55;font-size:10px;flex-shrink:0';
+    clearBtn.addEventListener( 'mouseenter', () => { clearBtn.style.opacity = '1'; } );
+    clearBtn.addEventListener( 'mouseleave', () => { clearBtn.style.opacity = '0.55'; } );
+    clearBtn.addEventListener( 'click', ( e ) => { e.stopPropagation(); _lapTimerClearAll(); } );
+
+    const listEl = document.createElement( 'div' );
+
+    panel.append( statsEl, listEl );
+
+    bar.addEventListener( 'click', () => _lapTimerToggleExpanded() );
+
+    root.append( panel, bar );
+    document.body.appendChild( root );
+
+    lapTimer.root = root;
+    lapTimer.bar = bar;
+    lapTimer.timeEl = timeEl;
+    lapTimer.arrowEl = arrowEl;
+    lapTimer.panel = panel;
+    lapTimer.listEl = listEl;
+    lapTimer.statsEl = statsEl;
+    lapTimer.clearBtn = clearBtn;
+
+    _lapTimerLoadForMap();
+    _lapTimerRefreshPanel();
+
+    // Expose so you can call from anywhere (or test from devtools).
+    window.completeLap = completeLap;
+    window.lapTimer = lapTimer;
+
+}
+
+function _lapTimerStorageKey() { return LAP_STORAGE_PREFIX + currentMapId; }
+
+function _lapTimerLoadForMap() {
+
+    try {
+
+        const raw = localStorage.getItem( _lapTimerStorageKey() );
+        lapTimer.laps = raw ? JSON.parse( raw ) : [];
+        if ( ! Array.isArray( lapTimer.laps ) ) lapTimer.laps = [];
+
+    } catch {
+
+        lapTimer.laps = [];
+
+    }
+
+    // Each map change = fresh, disarmed timer.
+    lapTimer.running = false;
+    lapTimer.armed = false;
+    lapTimer.elapsed = 0;
+    lapTimer.startTime = 0;
+    _resetLapAccumulators();
+    if ( lapTimer.timeEl ) lapTimer.timeEl.textContent = '0:00.00';
+    _updateLapFinishForward();
+
+}
+
+function _lapTimerSave() {
+
+    try {
+
+        localStorage.setItem( _lapTimerStorageKey(), JSON.stringify( lapTimer.laps ) );
+
+    } catch {}
+
+}
+
+function _lapTimerClearAll() {
+
+    lapTimer.laps = [];
+    _lapTimerSave();
+    _lapTimerRefreshPanel();
+
+}
+
+function _lapTimerToggleExpanded() {
+
+    lapTimer.expanded = ! lapTimer.expanded;
+    lapTimer.panel.style.display = lapTimer.expanded ? 'block' : 'none';
+    lapTimer.arrowEl.textContent = lapTimer.expanded ? '▼' : '▲';
+
+}
+
+function _lapTimerRefreshPanel() {
+
+    const laps = lapTimer.laps;
+    const best = laps.length ? Math.min( ...laps.map( l => l.time ) ) : null;
+    const avg = laps.length ? laps.reduce( ( s, l ) => s + l.time, 0 ) / laps.length : null;
+
+    // Stats row inside the panel.
+    lapTimer.statsEl.innerHTML = '';
+    const left = document.createElement( 'span' );
+    left.innerHTML =
+        `<span style="opacity:0.55">best </span><span style="color:#5DD68F">${ best != null ? _fmtLap( best ) : '—' }</span>` +
+        `  <span style="opacity:0.4">·</span>  ` +
+        `<span style="opacity:0.55">avg </span>${ avg != null ? _fmtLap( avg ) : '—' }` +
+        `  <span style="opacity:0.4">·</span>  ` +
+        `<span style="opacity:0.55">${ laps.length } lap${ laps.length === 1 ? '' : 's' }</span>`;
+    lapTimer.statsEl.append( left, lapTimer.clearBtn );
+
+    // List — newest first.
+    lapTimer.listEl.innerHTML = '';
+    if ( laps.length === 0 ) {
+
+        const empty = document.createElement( 'div' );
+        empty.textContent = 'no laps yet';
+        empty.style.cssText = 'opacity:0.45;font-style:italic;padding:4px 0';
+        lapTimer.listEl.appendChild( empty );
+
+    } else {
+
+        for ( let i = laps.length - 1; i >= 0; i -- ) {
+
+            const lap = laps[ i ];
+            const row = document.createElement( 'div' );
+            row.style.cssText = 'display:flex;justify-content:space-between;padding:2px 0';
+            const num = document.createElement( 'span' );
+            num.textContent = `#${ i + 1 }`;
+            num.style.opacity = '0.45';
+            const t = document.createElement( 'span' );
+            t.textContent = _fmtLap( lap.time );
+            if ( lap.time === best ) t.style.color = '#5DD68F';
+            row.append( num, t );
+            lapTimer.listEl.appendChild( row );
+
+        }
+
+    }
+
+}
+
+// Finish line = a horizontal plane through spawnPoint, perpendicular to the
+// car's spawn-forward heading. We treat each frame as a sign-flip test on
+// the signed along-track distance + a lateral tolerance so we only count
+// crossings near the actual spawn marker (not the infinite plane extension).
+//
+// Several gates layered on top so accidental + cheese crossings don't count:
+//
+//   1. directional (prev < 0 → curr ≥ 0): only forward crossings register.
+//      A U-turn-and-drive-back approach has prev > 0 throughout, never fires.
+//
+//   2. lateral < FINISH_LATERAL_TOL: only crossings near the spawn marker
+//      count — the line is a segment, not an infinite plane.
+//
+//   3. maxForward ≥ FINISH_MIN_MAX_FWD: car has to actually get DOWN the
+//      track. A short forward-then-reverse trick fails this.
+//
+//   4. minForward ≤ FINISH_MIN_MIN_FWD (negative): the car had to come back
+//      AROUND from the other side. Loitering near the line / hopping across
+//      via reverse never goes far enough negative.
+//
+//   5. travelled path length ≥ FINISH_MIN_TRAVEL: integral of |Δpos|. Catches
+//      drift-near-spawn loops that somehow pass the others.
+//
+//   6. teleport guard: if a single frame's Δsigned is huge, treat it as a
+//      respawn / out-of-bounds snap and skip the crossing test that frame.
+//
+// No minimum lap time. Cruise at 10 km/h if you want — the position gates
+// already make a sub-30s lap physically impossible to drive anyway.
+const _lapFinishForward = new THREE.Vector3();
+const _lapFinishQuat = new THREE.Quaternion();
+const FINISH_LATERAL_TOL = 30;        // m
+const FINISH_MIN_MAX_FWD = 500;       // m — must have driven this far past start
+const FINISH_MIN_MIN_FWD = - 200;     // m — must have come back from this far behind
+const FINISH_MIN_TRAVEL = 1500;       // m — path length
+const FINISH_MAX_TELEPORT = 50;       // m per frame — bigger = treat as a snap
+
+function _updateLapFinishForward() {
+
+    _lapFinishQuat.copy( spawnQuaternion );
+    _lapFinishForward.set( 0, 0, - 1 ).applyQuaternion( _lapFinishQuat );
+    _lapFinishForward.y = 0;
+    if ( _lapFinishForward.lengthSq() < 1e-4 ) _lapFinishForward.set( 0, 0, - 1 );
+    _lapFinishForward.normalize();
+
+}
+
+function _resetLapAccumulators() {
+
+    if ( ! lapTimer ) return;
+    lapTimer.maxSignedDist = 0;
+    lapTimer.minSignedDist = 0;
+    lapTimer.travelled = 0;
+    lapTimer.prevChassisPos = null;
+    lapTimer.prevSignedDist = undefined;
+
+}
+
+function _checkFinishLineCross() {
+
+    if ( ! lapTimer || ! lapTimer.running || ! chassis ) return;
+
+    const t = chassis.translation();
+    const dx = t.x - spawnPoint.x;
+    const dz = t.z - spawnPoint.z;
+
+    const fx = _lapFinishForward.x;
+    const fz = _lapFinishForward.z;
+
+    // along-track (signed) and cross-track (unsigned) distances to the line.
+    const signed = dx * fx + dz * fz;
+    const lateral = Math.abs( dx * ( - fz ) + dz * fx );
+
+    // Per-frame path length — clipped against teleport-size steps so that
+    // a fall-and-respawn doesn't inflate the travel budget.
+    if ( lapTimer.prevChassisPos ) {
+
+        const sx = t.x - lapTimer.prevChassisPos.x;
+        const sy = t.y - lapTimer.prevChassisPos.y;
+        const sz = t.z - lapTimer.prevChassisPos.z;
+        const step = Math.sqrt( sx * sx + sy * sy + sz * sz );
+        if ( step < FINISH_MAX_TELEPORT ) lapTimer.travelled += step;
+
+    } else {
+
+        lapTimer.prevChassisPos = { x: 0, y: 0, z: 0 };
+
+    }
+
+    lapTimer.prevChassisPos.x = t.x;
+    lapTimer.prevChassisPos.y = t.y;
+    lapTimer.prevChassisPos.z = t.z;
+
+    // Extremes of along-track signed distance over the lap so far.
+    if ( signed > lapTimer.maxSignedDist ) lapTimer.maxSignedDist = signed;
+    if ( signed < lapTimer.minSignedDist ) lapTimer.minSignedDist = signed;
+
+    const prev = lapTimer.prevSignedDist;
+
+    // Teleport guard: a big jump in signed (R reset, off-map snap) is not a
+    // physical crossing. Re-anchor prev and bail this frame.
+    if ( prev !== undefined && Math.abs( signed - prev ) > FINISH_MAX_TELEPORT ) {
+
+        lapTimer.prevSignedDist = signed;
+        return;
+
+    }
+
+    const isForwardCrossing = prev !== undefined && prev < 0 && signed >= 0;
+    const nearLine = lateral < FINISH_LATERAL_TOL;
+    const wentFarEnough = lapTimer.maxSignedDist >= FINISH_MIN_MAX_FWD;
+    const cameFromBehind = lapTimer.minSignedDist <= FINISH_MIN_MIN_FWD;
+    const travelledEnough = lapTimer.travelled >= FINISH_MIN_TRAVEL;
+
+    if ( isForwardCrossing && nearLine &&
+         wentFarEnough && cameFromBehind && travelledEnough ) {
+
+        completeLap();
+
+    }
+
+    lapTimer.prevSignedDist = signed;
+
+}
+
+// Returns true if ANY meaningful input has been seen this frame.
+// Used to gate the lap timer from starting under pure rolling motion.
+function _anyInputActive() {
+
+    if ( input.keyW || input.keyS || input.keyA || input.keyD || input.keyE ||
+         input.arrowUp || input.arrowDown || input.arrowLeft || input.arrowRight ||
+         input.keySpace ) return true;
+
+    if ( touch.enabled && ( touch.throttle > 0.05 || touch.brake > 0.05 ||
+         Math.abs( touch.steer ) > 0.05 || touch.handbrake > 0.05 ) ) return true;
+
+    // Gamepad — any button down or any axis past the deadzone.
+    if ( gamepad.index >= 0 ) {
+
+        const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+        const pad = pads[ gamepad.index ];
+        if ( pad ) {
+
+            for ( let i = 0; i < pad.buttons.length; i ++ ) {
+
+                if ( pad.buttons[ i ] && pad.buttons[ i ].pressed ) return true;
+
+            }
+
+            for ( let i = 0; i < pad.axes.length; i ++ ) {
+
+                if ( Math.abs( pad.axes[ i ] ) > 0.2 ) return true;
+
+            }
+
+        }
+
+    }
+
+    return false;
+
+}
+
+function updateLapTimer() {
+
+    if ( ! lapTimer ) return;
+
+    // Arm on first real input. The chassis can creep on inclines under
+    // gravity alone — we don't want that to start a phantom lap.
+    if ( ! lapTimer.armed && _anyInputActive() ) {
+
+        lapTimer.armed = true;
+        lapTimer.running = true;
+        lapTimer.startTime = performance.now();
+        lapTimer.elapsed = 0;
+        _resetLapAccumulators();
+
+    }
+
+    if ( lapTimer.running ) {
+
+        lapTimer.elapsed = performance.now() - lapTimer.startTime;
+        lapTimer.timeEl.textContent = _fmtLap( lapTimer.elapsed );
+        _checkFinishLineCross();
+
+    }
+
+}
+
+// Call this when the player crosses the start/finish line.
+// Records the split, persists, refreshes the drop-up, restarts the clock
+// from zero for the next lap. No-op if the timer hasn't been armed yet.
+function completeLap() {
+
+    if ( ! lapTimer || ! lapTimer.running ) return;
+    const ms = performance.now() - lapTimer.startTime;
+    if ( ms < 1000 ) return; // guard against double-triggering on the same line
+    lapTimer.laps.push( { time: ms, ts: Date.now() } );
+    _lapTimerSave();
+    _lapTimerRefreshPanel();
+    lapTimer.startTime = performance.now();
+    lapTimer.elapsed = 0;
+    _resetLapAccumulators();
+
+}
+
+// Called from the R-reset path so the next lap starts fresh and re-armed.
+function lapTimerResetCurrent() {
+
+    if ( ! lapTimer ) return;
+    lapTimer.running = false;
+    lapTimer.armed = false;
+    lapTimer.elapsed = 0;
+    lapTimer.startTime = 0;
+    _resetLapAccumulators();
+    if ( lapTimer.timeEl ) lapTimer.timeEl.textContent = '0:00.00';
 
 }
 
@@ -1789,6 +2237,7 @@ async function init() {
     initTouchControls();
     initCarToast();
     initMinimap();
+    initLapTimer();
     initSkidMarks();
     initVolumeSlider();
     _positionStatsBelowInfo();
@@ -2255,6 +2704,9 @@ async function swapMap( id ) {
     const cfg = MAPS[ id ];
     spawnPoint.set( cfg.spawnPos.x, cfg.spawnPos.y, cfg.spawnPos.z );
     spawnQuaternion.set( cfg.spawnRot.x, cfg.spawnRot.y, cfg.spawnRot.z, cfg.spawnRot.w );
+
+    // Swap the lap-history bucket — each map has its own best times.
+    if ( lapTimer ) { _lapTimerLoadForMap(); _lapTimerRefreshPanel(); }
 
     // 5) Load the new track geometry + collider mesh.
     await loadTrack();
@@ -3684,6 +4136,7 @@ function applyVehicleForces( speed, dt ) {
         resetTires();
         resetDrivetrain();
         clearSkidMarks();
+        lapTimerResetCurrent();
         return;
 
     }
@@ -3914,6 +4367,8 @@ function animate( time ) {
         updateStatsForNerds( speed );
 
         updateAudio( delta );
+
+        updateLapTimer();
 
     }
 
