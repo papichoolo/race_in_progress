@@ -1198,6 +1198,20 @@ async function _dsAttach( device ) {
         ds.authorized = true;
         try { localStorage.setItem( 'dualsenseAuthorized', '1' ); } catch ( _ ) {}
         _dsUpdateButton();
+        console.log( `[dualsense] attached via ${ ds.transport }, vendor ${ device.vendorId?.toString( 16 ) } product ${ device.productId?.toString( 16 ) }` );
+        // Confirmation pulse: 600 ms of strong constant resistance on
+        // both triggers so the player can verify the link is live before
+        // they even hit the throttle. After 600 ms the per-frame mapper
+        // takes over and the pull goes back to RPM/brake-driven.
+        try {
+
+            dsTriggerFeedback( 'R2', 80, 200 );
+            dsTriggerFeedback( 'L2', 80, 200 );
+            ds.lastFlushAt = 0;
+            await dsFlush();
+            console.log( '[dualsense] sent test pulse: R2/L2 feedback startPos 80 force 200' );
+
+        } catch ( e ) { console.warn( '[dualsense] test pulse failed:', e?.message || e ); }
         return true;
 
     } catch ( err ) {
@@ -1285,6 +1299,10 @@ function _dsUpdateButton() {
         _dsButtonEl.style.display = 'none';
 
     }
+    // Adding/removing this row changes #info's height, which would
+    // otherwise leave the "stats for nerds" toggle button overlapping
+    // the bottom of the cheatsheet.
+    if ( typeof _positionStatsBelowInfo === 'function' ) _positionStatsBelowInfo();
 
 }
 
