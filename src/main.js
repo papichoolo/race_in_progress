@@ -3437,24 +3437,30 @@ const CARS = [
     },
     // God Car — physically impossible: max grip, 10 gears, flat torque, near-instant stops.
     // Easy-mode tank, forgives every input, ~400+ km/h, perfect balance.
+    // De-twitched: was mass 5 + force 300 + engineInertia 0.04 + susp stiffness 48,
+    // which produced ~6g longitudinal accel and a knife-edge chassis with zero
+    // roll telegraph. Doubled the mass + raised the flywheel + softened the
+    // suspension so the player can read what the car is doing and the assists
+    // have something to bite into. Top-end perf preserved by raising downforce
+    // and trimming engine force only modestly relative to the mass increase.
     {
         name: 'God Car',
         bodyColor: 0xF0F0F8,
         soundFile: 'sounds/engines/god.mp3', soundLoopStart: 3.0,
         pitchMin: 0.4, pitchMax: 4.5,
-        mass: 5, chassisFriction: 1.0,
-        maxEngineForce: 300, engineIdleRpm: 1000, engineRedline: 20000,
+        mass: 10, chassisFriction: 1.0,
+        maxEngineForce: 240, engineIdleRpm: 1000, engineRedline: 20000,
         peakTorqueRpm: 10000, torqueCurveWidth: 9000,
         gearRatios: [ 3.2, 2.6, 2.1, 1.75, 1.45, 1.2, 1.0, 0.85, 0.72, 0.6 ], reverseRatio: - 3.0, finalDrive: 4.0,
         autoUpshiftRpm: 19000, autoDownshiftRpm: 2500,
         wheelFrictionSlip: 5.5,
-        suspensionStiffness: 48, suspensionCompression: 3.1, suspensionRelaxation: 3.3,
-        suspensionRestLength: 0.28, wheelConnectionY: - 0.25,
-        maxBrakeForce: 5.5, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4,
+        suspensionStiffness: 32, suspensionCompression: 2.5, suspensionRelaxation: 2.7,
+        suspensionRestLength: 0.32, wheelConnectionY: - 0.28,
+        maxBrakeForce: 4.8, handbrakeMultiplier: 2.0, maxSteeringAngle: Math.PI / 4.6,
         brakeBias: 0.55,
         camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ 0, 0, 0.05, - 0.05 ],
-        engineInertia: 0.04, clutchStiffness: 1300, lsdLocking: 1.00,
-        Cd: 0.0165, Cl: 0.0700,
+        engineInertia: 0.18, clutchStiffness: 900, lsdLocking: 0.90,
+        Cd: 0.0165, Cl: 0.0850,
         driveType: 'AWD'
     }
 ];
