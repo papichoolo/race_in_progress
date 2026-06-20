@@ -778,7 +778,9 @@ function updateBrakeLights() {
 // pads. Silently no-ops on Safari and on pads without `vibrationActuator`.
 
 const rumble = {
-    enabled: true,
+    // master scale 0..1. Persisted to localStorage by the RUM slider in
+    // the controls overlay; 0 = off entirely.
+    strength: 1,
     // continuous baseline (set every frame from car state)
     contWeak: 0, contStrong: 0,
     // one-shot pulse (decays to 0 when onceEndsAt is in the past)
@@ -792,7 +794,7 @@ const rumble = {
 
 function rumblePulse( weak, strong, durationMs ) {
 
-    if ( ! rumble.enabled ) return;
+    if ( rumble.strength <= 0 ) return;
     const now = performance.now();
     const end = now + durationMs;
     // strongest pulse wins until it expires
@@ -817,15 +819,17 @@ function rumbleSetContinuous( weak, strong ) {
 
 function rumbleTick() {
 
-    if ( ! rumble.enabled || gamepad.index < 0 ) return;
+    if ( rumble.strength <= 0 || gamepad.index < 0 ) return;
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const pad = pads[ gamepad.index ];
     if ( ! pad || ! pad.vibrationActuator || ! pad.vibrationActuator.playEffect ) return;
     const now = performance.now();
     let oW = 0, oS = 0;
     if ( now < rumble.onceEndsAt ) { oW = rumble.onceWeak; oS = rumble.onceStrong; }
-    const weak = Math.max( oW, rumble.contWeak );
-    const strong = Math.max( oS, rumble.contStrong );
+    // Master scale applied here so the slider gain affects both the
+    // continuous baseline and any active one-shot pulse uniformly.
+    const weak = Math.max( oW, rumble.contWeak ) * rumble.strength;
+    const strong = Math.max( oS, rumble.contStrong ) * rumble.strength;
     if ( weak < 0.01 && strong < 0.01 ) return; // silence — nothing to play
     if ( now - rumble.lastIssued < rumble.reIssueMs ) return;
     rumble.lastIssued = now;
@@ -840,7 +844,7 @@ function rumbleTick() {
 
 function updateRumble( speed ) {
 
-    if ( ! rumble.enabled || ! vehicleController ) return;
+    if ( rumble.strength <= 0 || ! vehicleController ) return;
     // 1) Continuous surface buzz — proportional to speed, capped low. The
     //    weak motor is the small high-freq one; perfect for a "tyres on
     //    tarmac" hiss without the heavy thumping you get from a strong
@@ -3159,6 +3163,63 @@ function initVolumeSlider() {
 
 }
 
+// Controller-rumble strength slider. Same row pattern as VOL so it
+// inherits the .volume-row CSS (touch-action: auto, thumb styles, etc.).
+// Sliding to 0 turns rumble off entirely; persisted to localStorage.
+function initRumbleSlider() {
+
+    const infoEl = document.getElementById( 'info' );
+    if ( ! infoEl ) return;
+
+    const saved = parseFloat( localStorage.getItem( 'rumbleStrength' ) );
+    if ( Number.isFinite( saved ) && saved >= 0 && saved <= 1 ) rumble.strength = saved;
+
+    const row = document.createElement( 'div' );
+    row.className = 'volume-row';
+
+    const label = document.createElement( 'span' );
+    label.textContent = 'RUM';
+    label.style.opacity = '0.85';
+
+    const slider = document.createElement( 'input' );
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '1';
+    slider.step = '0.01';
+    slider.value = String( rumble.strength );
+
+    const readout = document.createElement( 'span' );
+    readout.textContent = Math.round( rumble.strength * 100 );
+
+    row.appendChild( label );
+    row.appendChild( slider );
+    row.appendChild( readout );
+    // Insert right after the existing VOL row (which initVolumeSlider
+    // prepended as #info's first child) so RUM sits directly beneath it.
+    const volRow = infoEl.querySelector( '.volume-row' );
+    if ( volRow && volRow.nextSibling ) infoEl.insertBefore( row, volRow.nextSibling );
+    else infoEl.insertBefore( row, infoEl.firstChild );
+
+    slider.addEventListener( 'input', () => {
+
+        const v = parseFloat( slider.value );
+        rumble.strength = v;
+        readout.textContent = Math.round( v * 100 );
+        localStorage.setItem( 'rumbleStrength', String( v ) );
+        // If user dragged to zero, kill any active pulse so nothing
+        // lingers in the controller motor for the next 140 ms.
+        if ( v <= 0 ) {
+
+            rumble.contWeak = 0;
+            rumble.contStrong = 0;
+            rumble.onceEndsAt = 0;
+
+        }
+
+    } );
+
+}
+
 async function startAudio() {
 
     // Already initialized — just make sure the context is running. Browsers
@@ -3939,6 +4000,7 @@ async function init() {
     initMultiplayer();
     initSkidMarks();
     initVolumeSlider();
+    initRumbleSlider();
     renderControlsCheatsheet();
     _positionStatsBelowInfo();
     window.addEventListener( 'resize', _positionStatsBelowInfo );
