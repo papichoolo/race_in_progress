@@ -960,10 +960,7 @@ const ds = {
     tcBumpUntil: 0,
     prevAbsEngaged: false,
     absPulseUntil: 0,
-    prevOffTrack: false,
-    // Debug: when > 0, _dsTestForce overrides the L2 mapper output with a
-    // constant Feedback force. Wired up by the "TEST L2" slider in #info.
-    testForceL2: 0
+    prevOffTrack: false
 };
 
 // Sony's HID filter — covers the DualSense USB IDs we've seen in the wild.
@@ -1406,56 +1403,6 @@ function initDualsenseButton() {
     if ( anchor && anchor.nextSibling ) infoEl.insertBefore( row, anchor.nextSibling );
     else infoEl.appendChild( row );
 
-    // ---- TEST L2 slider — debug, will be removed ------------------------
-    // Sits directly under the "+ adaptive triggers" button. Slides 0..255
-    // and feeds straight into ds.testForceL2; when > 0, updateDualsense()
-    // ignores the per-frame mapper for L2 and just hands the requested
-    // constant force to the controller. Lets the player verify the
-    // protocol works in isolation. NOT persisted to localStorage.
-    const testRow = document.createElement( 'div' );
-    testRow.className = 'volume-row';
-
-    const testLabel = document.createElement( 'span' );
-    testLabel.textContent = 'TEST L2';
-    testLabel.style.opacity = '0.6';
-    testLabel.style.fontStyle = 'italic';
-    testLabel.title = 'debug — will be removed';
-
-    const testSlider = document.createElement( 'input' );
-    testSlider.type = 'range';
-    testSlider.min = '0';
-    testSlider.max = '255';
-    testSlider.step = '1';
-    testSlider.value = '0';
-    testSlider.title = 'test — will be removed';
-
-    const testReadout = document.createElement( 'span' );
-    testReadout.textContent = '0';
-    testReadout.style.opacity = '0.6';
-
-    testRow.appendChild( testLabel );
-    testRow.appendChild( testSlider );
-    testRow.appendChild( testReadout );
-    if ( row.nextSibling ) infoEl.insertBefore( testRow, row.nextSibling );
-    else infoEl.appendChild( testRow );
-
-    testSlider.addEventListener( 'input', () => {
-
-        const v = Math.max( 0, Math.min( 255, parseInt( testSlider.value, 10 ) || 0 ) );
-        ds.testForceL2 = v;
-        testReadout.textContent = String( v );
-        // Bypass the rate-limit on this gesture so the player gets
-        // immediate tactile confirmation as they drag.
-        if ( ds.device && ! ds.disabled ) {
-
-            if ( v > 0 ) dsTriggerFeedback( 'L2', 20, v );
-            else dsTriggerOff( 'L2' );
-            ds.lastFlushAt = 0;
-            dsFlush();
-
-        }
-
-    } );
     if ( typeof _positionStatsBelowInfo === 'function' ) _positionStatsBelowInfo();
 
     _dsButtonEl = btn;
@@ -1507,10 +1454,7 @@ function updateDualsense( speed ) {
 
     if ( ! ds.device || ds.disabled ) return;
     // Honour the master "haptics off" slider — RUM=0 → all triggers OFF.
-    // The TEST L2 slider is a debug override that ignores RUM specifically
-    // so the player can verify the protocol works in isolation.
-    const testActive = ds.testForceL2 > 0;
-    if ( rumble.strength <= 0 && ! testActive ) {
+    if ( rumble.strength <= 0 ) {
 
         dsTriggerOff( 'L2' );
         dsTriggerOff( 'R2' );
@@ -1578,15 +1522,9 @@ function updateDualsense( speed ) {
     const brake = input.brake || 0;
     const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
 
-    if ( testActive ) {
-
-        // Debug override: ignore everything else, just hold the requested
-        // raw force on L2 so the player can confirm the protocol works.
-        dsTriggerFeedback( 'L2', 20, ds.testForceL2 | 0 );
-
-    // Same event-only philosophy for the brake: free trigger normally,
+    // Event-only philosophy for the brake: free trigger normally,
     // resistance ONLY when ABS engages or under a hard panic brake.
-    } else if ( drivetrain.abs.engaged && brake > 0.4 ) {
+    if ( drivetrain.abs.engaged && brake > 0.4 ) {
 
         // ABS pulse — 12 Hz vibration, moderate force so the player
         // still has brake authority. Only fires under sustained brake
