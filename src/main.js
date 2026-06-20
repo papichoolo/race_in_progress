@@ -1038,29 +1038,42 @@ function _dsSetTrigger( side, mode, params ) {
 
 function dsTriggerOff( side ) { _dsSetTrigger( side, 0x00, [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ] ); }
 
+// All adaptive-trigger parameters are 0..255 in the native protocol
+// (verified against github.com/daidr/dualsense-tester reference).
+// Earlier impl clamped to 0..9 / 0..8 which silently produced
+// almost-no-force — the player felt nothing.
+
+// Mode 0x01 — constant resistance from `startPos` to end of pull.
+// params: [start, force]
 function dsTriggerFeedback( side, startPos, force ) {
 
-    const s = Math.max( 0, Math.min( 9, startPos | 0 ) );
-    const f = Math.max( 0, Math.min( 8, force | 0 ) );
+    const s = Math.max( 0, Math.min( 255, startPos | 0 ) );
+    const f = Math.max( 0, Math.min( 255, force | 0 ) );
     _dsSetTrigger( side, 0x01, [ s, f, 0, 0, 0, 0, 0, 0, 0, 0 ] );
 
 }
 
+// Mode 0x02 — soft trigger / weapon: light pull until `startPos`, then
+// stiffens through `endPos`, then snaps free past `endPos`.
+// params: [start, end, force]
 function dsTriggerWeapon( side, startPos, endPos, force ) {
 
-    const s = Math.max( 2, Math.min( 7, startPos | 0 ) );
-    const e = Math.max( s + 1, Math.min( 8, endPos | 0 ) );
-    const f = Math.max( 0, Math.min( 8, force | 0 ) );
-    _dsSetTrigger( side, 0x06, [ s, e, f, 0, 0, 0, 0, 0, 0, 0 ] );
+    const s = Math.max( 0, Math.min( 254, startPos | 0 ) );
+    const e = Math.max( s + 1, Math.min( 255, endPos | 0 ) );
+    const f = Math.max( 0, Math.min( 255, force | 0 ) );
+    _dsSetTrigger( side, 0x02, [ s, e, f, 0, 0, 0, 0, 0, 0, 0 ] );
 
 }
 
-function dsTriggerVibration( side, startPos, frequency, amplitude ) {
+// Mode 0x06 — vibrate at `frequency` Hz with `force` strength once the
+// trigger crosses `startPos`. Frequency is in Hz (0..15-ish useful).
+// params: [frequency, force, start]
+function dsTriggerVibration( side, startPos, frequency, force ) {
 
-    const s = Math.max( 0, Math.min( 9, startPos | 0 ) );
-    const fr = Math.max( 0, Math.min( 255, frequency | 0 ) );
-    const a = Math.max( 0, Math.min( 8, amplitude | 0 ) );
-    _dsSetTrigger( side, 0x05, [ s, fr, a, 0, 0, 0, 0, 0, 0, 0 ] );
+    const s = Math.max( 0, Math.min( 255, startPos | 0 ) );
+    const fr = Math.max( 0, Math.min( 15, frequency | 0 ) );
+    const f = Math.max( 0, Math.min( 255, force | 0 ) );
+    _dsSetTrigger( side, 0x06, [ fr, f, s, 0, 0, 0, 0, 0, 0, 0 ] );
 
 }
 
@@ -1344,89 +1357,80 @@ function updateDualsense( speed ) {
         return;
 
     }
-    // Scale 0..1 so RUM=40 (the default "calm" baseline) feels right and
-    // RUM=100 adds noticeable bite without ever feeling angry.
+    // Scale 0..1 so RUM=40 (the default "calm" baseline) maps to ~0.6 of
+    // the max-strength force values below, and RUM=100 reaches full bite
+    // without ever pinning the trigger solid (forces capped at 255 max).
     const scale = Math.min( 1.5, rumble.strength * 1.5 );
     const now = performance.now();
 
     // ---- R2 (throttle) ---------------------------------------------------
-    // Base: feedback resistance that climbs from idle to redline, so the
-    // pull feels light at low RPM and stiffens as the tach climbs. Past
-    // redline we flip to Weapon mode for a hard wall snap — the same
-    // tactile cue you get from a real rev-limiter intervening.
+    // Feedback resistance that climbs from idle to redline; past redline
+    // a Weapon-mode wall for the rev-limiter clack. Force range is the
+    // native 0..255 — earlier impl was clamped to 0..8 (~3% of max) so
+    // the trigger felt completely loose.
     const rpm = engine.rpm || 0;
     const redline = engine.redline || 7500;
     const idle = engine.idleRpm || 900;
     const rpmNorm = Math.max( 0, Math.min( 1.2, ( rpm - idle ) / Math.max( 1, redline - idle ) ) );
-    // TC engage edge — short ~200ms bump on the throttle trigger so the
-    // player feels the cut. Decays back into the RPM curve.
     if ( drivetrain.tc.engaged && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 200;
     ds.prevTcEngaged = drivetrain.tc.engaged;
     const tcBumping = now < ds.tcBumpUntil;
 
     if ( rpm >= redline * 0.99 ) {
 
-        // Past redline: hard break at trigger pos 6 — that's the "rev
-        // limiter clack". Force capped at 8 because this is the one
-        // moment we *want* the player to feel the controller fighting back.
-        const wf = Math.round( 8 * scale );
-        dsTriggerWeapon( 'R2', 5, 7, Math.max( 4, wf ) );
+        // Rev limiter: hard wall at trigger pos ~180/255 (~70 % pulled),
+        // snapping free at ~230. Always at full force regardless of scale
+        // — this is the one event we want the player to feel firmly.
+        dsTriggerWeapon( 'R2', 180, 230, 255 );
 
     } else if ( tcBumping ) {
 
-        // Tactile cue for TC cutting in. Slightly firmer than the cruise
-        // resistance, but never above 6.
-        dsTriggerFeedback( 'R2', 2, Math.round( 4 * scale ) );
+        // TC engage bump: firm resistance over the back half of the pull
+        // for ~200 ms after TC kicks in.
+        dsTriggerFeedback( 'R2', 60, Math.round( 200 * scale ) );
 
     } else if ( rpmNorm <= 0.05 ) {
 
-        // At/near idle: trigger free so blips feel responsive.
         dsTriggerOff( 'R2' );
 
     } else {
 
-        // Cruise: smooth ramp 1..6 from idle→redline.
-        const f = Math.max( 1, Math.min( 6, Math.round( 1 + rpmNorm * 5 * scale ) ) );
-        // Start position 2 keeps the first ~20% of trigger travel free —
-        // light blips don't feel notchy, only sustained throttle loads up.
-        dsTriggerFeedback( 'R2', 2, f );
+        // Cruise resistance: starts at ~40/255 trigger pos (so light
+        // blips stay responsive), force climbs from 60 → 220 as RPM
+        // sweeps from idle to redline.
+        const f = Math.max( 40, Math.min( 220, Math.round( ( 60 + rpmNorm * 160 ) * scale ) ) );
+        dsTriggerFeedback( 'R2', 40, f );
 
     }
 
     // ---- L2 (brake) ------------------------------------------------------
-    // Pedal-feel: heavier as you push harder. ABS engagement overrides
-    // with a low-Hz vibration to imitate the pedal pulsing back at your
-    // foot during a panic stop. Reverse-engaged gives a barely-there
-    // resistance so the player remembers R is latched.
     const brake = input.brake || 0;
     if ( drivetrain.abs.engaged && brake > 0.15 ) {
 
-        // ABS pulse — ~10 Hz, amplitude scaled but capped low; this is
-        // information, not punishment.
-        const amp = Math.max( 2, Math.min( 6, Math.round( 4 * scale ) ) );
-        dsTriggerVibration( 'L2', 2, 10, amp );
+        // ABS pulse — 10 Hz vibration at decent force so it actually
+        // feels like the pedal pulsing back. Starts almost from the top
+        // of the pull (pos 30/255 ≈ 12 %).
+        dsTriggerVibration( 'L2', 30, 10, Math.round( 200 * scale ) );
 
     } else if ( brake > 0.02 ) {
 
-        // Force 0..6 mapped from brake 0..1; force 8 only for full panic
-        // brake. Start position 1 = almost from the top of the pull, so
-        // even a light brake gives a confirming bit of weight.
-        const target = brake >= 0.98 ? 8 : Math.round( brake * 6 );
-        // Trail-braking bonus: when steering and braking together (the
-        // moment a real driver wants the most pedal feedback to feel the
-        // weight transfer), the trigger gets stiffer by up to +2 force.
-        // Scales with |steer| × brake so it ramps in smoothly rather than
-        // snapping on the moment the wheel moves.
+        // Pedal feel: light squeeze at low brake input, stiff at heavy
+        // brake. Native-protocol force range 60..240; trail-braking
+        // (steer + brake together) adds up to +60 more force so the
+        // pedal stiffens when leaning the car into a corner — the
+        // moment a real driver wants the most pedal feedback for
+        // weight-transfer feel.
         const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
-        const trailBonus = steerMag * brake * 2;
-        const f = Math.max( 1, Math.min( 8, Math.round( ( target + trailBonus ) * scale ) ) );
-        dsTriggerFeedback( 'L2', 1, f );
+        const trailBonus = steerMag * brake * 60;
+        const target = 60 + brake * 180 + trailBonus; // 60..300 pre-clamp
+        const f = Math.max( 40, Math.min( 255, Math.round( target * scale ) ) );
+        // Start position 20/255 ≈ pull starts loading almost immediately.
+        dsTriggerFeedback( 'L2', 20, f );
 
     } else if ( input.reverseEngaged ) {
 
-        // Very light reminder that reverse is latched. Stays out of the
-        // way until the player actually pushes the brake/throttle.
-        dsTriggerFeedback( 'L2', 2, 1 );
+        // Light reverse-latched reminder.
+        dsTriggerFeedback( 'L2', 60, Math.round( 50 * scale ) );
 
     } else {
 
