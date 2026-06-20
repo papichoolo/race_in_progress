@@ -3654,7 +3654,17 @@ const MAPS = {
         // these world-space points gets hidden + has no trimesh collider.
         excludeMeshesNear: [
             { x: - 135.47, y: 10.35, z: - 152.55, radius: 4 }
-        ]
+        ],
+        // Per-material visual overrides applied at load time. The community
+        // GLB ships some materials with placeholder / debug textures
+        // (NODE.001 = a 128² yellow-bg UV-check card with TOP / no-entry /
+        // FRONTAL symbols, mapped onto every grandstand seating section so
+        // the stands look like a colour test pattern). We can't delete the
+        // geometry (one shared primitive across ~all stands), so we strip
+        // its baseColorTexture and force a concrete-grey baseColorFactor.
+        materialOverrides: {
+            'NODE.001': { removeMap: true, color: 0x707276 }
+        }
     },
 };
 let currentMapId = 'nurburgring';
@@ -4228,6 +4238,7 @@ async function loadTrack() {
 
     const excludeList = mapCfg.excludeMeshesNear || [];
     const _excludeCenter = new THREE.Vector3();
+    const matOverrides = mapCfg.materialOverrides || {};
 
     track.traverse( ( obj ) => {
 
@@ -4258,6 +4269,24 @@ async function loadTrack() {
                     mat.needsUpdate = true;
 
                 }
+
+            }
+
+            // Per-map material overrides: swap debug textures for plain
+            // colour fills. Names matched against the .name field that
+            // GLTFLoader copies from the source material.
+            const ovName = matName;
+            if ( ovName && matOverrides[ ovName ] ) {
+
+                const ov = matOverrides[ ovName ];
+                if ( ov.removeMap && obj.material.map ) {
+
+                    obj.material.map.dispose();
+                    obj.material.map = null;
+
+                }
+                if ( ov.color != null ) obj.material.color.setHex( ov.color );
+                obj.material.needsUpdate = true;
 
             }
 
