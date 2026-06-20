@@ -2,7 +2,7 @@
 
 ## Latest Commit
 
-- Map 4 (Suzuka) spawn re-captured to `(499.42, 0.12, 342.80)` / rot `(0.0167, 0.0052, 0.0001, 0.9998)` — drops the player on the actual main straight pointing straight down the road instead of the prior off-pit-lane pose. **(HEAD)**
+- Map 4 (Suzuka) spawn re-captured again to `(505.02, -5.37, 504.37)` / rot `(0.0026, -0.9995, -0.0158, 0.0257)` — corrects the previous pose. **(HEAD)**
 
 ## all commits
 
@@ -44,3 +44,4 @@
 - De-twitch the God Car. Old config (mass 5, force 300, engineInertia 0.04, susp stiffness 48) gave ~6g longitudinal accel and a knife-edge chassis with no body roll to telegraph weight transfer — every input cracked the car into a snap reaction the global assists couldn't bite into. Re-tuned: `mass` 5→10 (still light but double the inertia so impulses damp), `maxEngineForce` 300→240 (power-to-weight ≈24 — still god-tier, just not unhinged), `engineInertia` 0.04→0.18 (flywheel smoothness, throttle blips don't snap-rev), suspension softened (stiffness 48→32, compression 3.1→2.5, relaxation 3.3→2.7, restLength 0.28→0.32) so weight transfer is visible and rideable, `maxSteeringAngle` π/4→π/4.6 (less twitch on stick flicks), `clutchStiffness` 1300→900 + `lsdLocking` 1.00→0.90 (tiny inside-wheel slip on tight corners instead of pivoting on a dime), `Cl` 0.07→0.085 (extra downforce keeps top-end stability after the mass bump), `maxBrakeForce` 5.5→4.8 (still strongest in the fleet). Other 6 cars untouched.
 - Map 4 (Suzuka) car scale dropped 30 %: `MAPS.suzuka.carScale` 1.35 → 0.945. The 1.35 × scale-up overshot for Suzuka's narrower geometry; this brings the car visual closer to true track-relative scale.
 - Map 4 (Suzuka) spawn re-captured to `(499.42, 0.12, 342.80)` / rot `(0.0167, 0.0052, 0.0001, 0.9998)` — drops the player on the actual main straight pointing straight down the road instead of the prior off-pit-lane pose.
+- Map 4 (Suzuka) spawn re-captured again to `(505.02, -5.37, 504.37)` / rot `(0.0026, -0.9995, -0.0158, 0.0257)` — corrects the previous pose.

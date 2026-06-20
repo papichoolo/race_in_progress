@@ -3594,8 +3594,8 @@ const MAPS = {
         // after the user captures one with P on the main straight.
         label: 'Suzuka Circuit (2001)',
         path: 'textures/models/suzuka.glb',
-        spawnPos: { x: 499.42, y: 0.12, z: 342.80 },
-        spawnRot: { x: 0.0167, y: 0.0052, z: 0.0001, w: 0.9998 },
+        spawnPos: { x: 505.02, y: - 5.37, z: 504.37 },
+        spawnRot: { x: 0.0026, y: - 0.9995, z: - 0.0158, w: 0.0257 },
         renderRadius: 1500,
         dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
         carScale: 0.945
