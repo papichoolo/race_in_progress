@@ -902,6 +902,542 @@ function updateRumble( speed ) {
 
 }
 
+// ---------------- DualSense adaptive triggers (WebHID) ----------------
+//
+// Sony's DualSense exposes two voice-coil actuators inside L2 and R2 that
+// can act as programmable resistance / vibration on the trigger pull.
+// The standard Web Gamepad API doesn't reach them — we have to talk to
+// the device directly over WebHID and write the right output report.
+//
+// Layout we use:
+//   - Trigger control block lives at offset 11 (R2) and 22 (L2) inside the
+//     "common" payload, 11 bytes each: mode byte + 10 parameter bytes.
+//   - Wire-level framing differs USB vs BT:
+//        USB: reportId=0x02, length=47 ( 1 flags hi + 1 flags lo + ... )
+//        BT : reportId=0x31, length=78, last 4 bytes = CRC32 over
+//             [0xA2, reportId, ...payload] with poly 0xEDB88320.
+//   - We always set both feature-flag bits 0+1 (=0x04 + 0x08 lo-byte mask)
+//     so the firmware actually applies our trigger fields and lifecycle
+//     bit 0 in the high flags so the LED / lightbar state isn't touched.
+//
+// The protocol layer is self-contained: feature-detect navigator.hid, fail
+// silent on Safari / Firefox / non-Sony pads, throttle re-writes to ~30 Hz,
+// auto-disable after 3 consecutive write errors. Public surface:
+//   dsTriggerOff(side)
+//   dsTriggerFeedback(side, startPos, force)
+//   dsTriggerWeapon(side, startPos, endPos, force)
+//   dsTriggerVibration(side, startPos, frequency, amplitude)
+// side is 'L2' or 'R2'. All numeric args get clamped to the spec range.
+//
+// References cross-checked against the community-reverse-engineered
+// `ds5w` / `pydualsense` projects + Sony's own driver report layouts.
+
+const ds = {
+    device: null,            // HIDDevice when claimed, else null
+    transport: 'usb',        // 'usb' | 'bt' (auto-detected from packet size)
+    authorized: false,       // persisted in localStorage as 'dualsenseAuthorized'
+    consecutiveErrors: 0,    // 3 strikes → disable
+    disabled: false,         // hard kill after repeated write failures
+    lastFlushAt: 0,          // last successful HID write timestamp
+    minFlushMs: 33,          // ~30 Hz cap on outbound reports
+    // Cached trigger state — when both sides match what we last sent and
+    // it's within minFlushMs of the last write, we skip the HID call.
+    // Each side is { mode, p: [10 bytes] }.
+    pending: {
+        L2: { mode: 0, p: [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ], dirty: true },
+        R2: { mode: 0, p: [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ], dirty: true }
+    },
+    lastSent: {
+        L2: { mode: 0xFF, p: [ - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1 ] },
+        R2: { mode: 0xFF, p: [ - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1 ] }
+    },
+    // Edge-tracking for the mapper.
+    prevTcEngaged: false,
+    tcBumpUntil: 0
+};
+
+// Sony's HID filter — covers the DualSense USB IDs we've seen in the wild.
+// requestDevice() lets the user pick; the IDs just narrow the picker so the
+// USB hub doesn't show every keyboard / mouse.
+const DS_FILTERS = [
+    { vendorId: 0x054C, productId: 0x0CE6 }, // DualSense (CFI-ZCT1W) original
+    { vendorId: 0x054C, productId: 0x0DF2 }, // DualSense Edge / later firmware
+    { vendorId: 0x054C }                     // anything else from Sony — fallback
+];
+
+// Sniff a connected gamepad and decide whether to surface the picker button.
+// Conservative: require either "dualsense" in the id string OR the Sony
+// vendor 054c hex. Avoids false positives on DualShock 4 (which doesn't
+// support adaptive triggers — they're motors-only).
+function _dsGamepadLooksLikeDualSense() {
+
+    if ( gamepad.index < 0 ) return false;
+    const id = ( gamepad.id || '' ).toLowerCase();
+    if ( id.includes( 'dualsense' ) ) return true;
+    // Sony VID often shows up as "054c" inside the id (Chrome) or as the
+    // raw "vendor: 1356" decimal (Firefox-style strings). We've also seen
+    // "wireless controller" on bluetooth; combine with vendor for safety.
+    if ( id.includes( '054c' ) ) return true;
+    if ( id.includes( 'sony' ) && id.includes( 'wireless controller' ) ) return true;
+    return false;
+
+}
+
+// CRC32 table (poly 0xEDB88320, reflected). Required for the BT report
+// trailer — the firmware drops any 78-byte report whose last 4 bytes
+// don't match crc32([0xA2, ...wholeReport[0..73]]).
+const _DS_CRC_TABLE = ( () => {
+
+    const t = new Uint32Array( 256 );
+    for ( let i = 0; i < 256; i ++ ) {
+
+        let c = i;
+        for ( let k = 0; k < 8; k ++ ) c = ( c & 1 ) ? ( 0xEDB88320 ^ ( c >>> 1 ) ) : ( c >>> 1 );
+        t[ i ] = c >>> 0;
+
+    }
+    return t;
+
+} )();
+
+function _dsCrc32( bytes ) {
+
+    let c = 0xFFFFFFFF;
+    for ( let i = 0; i < bytes.length; i ++ ) {
+
+        c = _DS_CRC_TABLE[ ( c ^ bytes[ i ] ) & 0xFF ] ^ ( c >>> 8 );
+
+    }
+    return ( c ^ 0xFFFFFFFF ) >>> 0;
+
+}
+
+// Equality on a side's pending state vs last-sent state — used to skip
+// redundant HID writes when nothing has changed.
+function _dsSideEquals( a, b ) {
+
+    if ( a.mode !== b.mode ) return false;
+    for ( let i = 0; i < 10; i ++ ) if ( a.p[ i ] !== b.p[ i ] ) return false;
+    return true;
+
+}
+
+// Public: write a "mode + 10 params" trigger block into the pending state.
+// Side-effect is deferred to the next dsFlush() — caller doesn't need to
+// throttle, that's our job.
+function _dsSetTrigger( side, mode, params ) {
+
+    if ( ds.disabled ) return;
+    const slot = ds.pending[ side ];
+    if ( ! slot ) return;
+    slot.mode = mode & 0xFF;
+    for ( let i = 0; i < 10; i ++ ) slot.p[ i ] = ( params[ i ] || 0 ) & 0xFF;
+    slot.dirty = true;
+
+}
+
+function dsTriggerOff( side ) { _dsSetTrigger( side, 0x00, [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ] ); }
+
+function dsTriggerFeedback( side, startPos, force ) {
+
+    const s = Math.max( 0, Math.min( 9, startPos | 0 ) );
+    const f = Math.max( 0, Math.min( 8, force | 0 ) );
+    _dsSetTrigger( side, 0x01, [ s, f, 0, 0, 0, 0, 0, 0, 0, 0 ] );
+
+}
+
+function dsTriggerWeapon( side, startPos, endPos, force ) {
+
+    const s = Math.max( 2, Math.min( 7, startPos | 0 ) );
+    const e = Math.max( s + 1, Math.min( 8, endPos | 0 ) );
+    const f = Math.max( 0, Math.min( 8, force | 0 ) );
+    _dsSetTrigger( side, 0x06, [ s, e, f, 0, 0, 0, 0, 0, 0, 0 ] );
+
+}
+
+function dsTriggerVibration( side, startPos, frequency, amplitude ) {
+
+    const s = Math.max( 0, Math.min( 9, startPos | 0 ) );
+    const fr = Math.max( 0, Math.min( 255, frequency | 0 ) );
+    const a = Math.max( 0, Math.min( 8, amplitude | 0 ) );
+    _dsSetTrigger( side, 0x05, [ s, fr, a, 0, 0, 0, 0, 0, 0, 0 ] );
+
+}
+
+// Build + push the actual HID report. Bails early on no device, no dirty
+// state, or rate-limit. All transport gotchas isolated here.
+async function dsFlush() {
+
+    if ( ds.disabled || ! ds.device || ! ds.device.opened ) return;
+    const now = performance.now();
+    const lDirty = ds.pending.L2.dirty || ! _dsSideEquals( ds.pending.L2, ds.lastSent.L2 );
+    const rDirty = ds.pending.R2.dirty || ! _dsSideEquals( ds.pending.R2, ds.lastSent.R2 );
+    if ( ! lDirty && ! rDirty ) return;
+    if ( now - ds.lastFlushAt < ds.minFlushMs ) return;
+
+    // Build the "common" payload (everything past the report-id and any
+    // BT-only prefix). Offsets follow the standard DualSense output report.
+    // Total common length = 47 bytes (USB writes these 47; BT pads and
+    // appends CRC32).
+    const common = new Uint8Array( 47 );
+    // Feature flags: bit0 = rumble enable (we leave 0 here so Gamepad-API
+    // rumble keeps owning the motors), bit2 = right-trigger effect,
+    // bit3 = left-trigger effect.
+    common[ 0 ] = 0x04 | 0x08;
+    common[ 1 ] = 0x00; // we don't touch LED / mute / mic — leave those bits 0
+    // Motor magnitudes (offset 2 / 3) stay 0 — rumbleTick() handles those
+    // through navigator.getGamepads().vibrationActuator on a different code path.
+    // R2 block starts at offset 10 (R2 mode at 10, R2 params 11..20).
+    common[ 10 ] = ds.pending.R2.mode;
+    for ( let i = 0; i < 10; i ++ ) common[ 11 + i ] = ds.pending.R2.p[ i ];
+    // L2 block starts at offset 21.
+    common[ 21 ] = ds.pending.L2.mode;
+    for ( let i = 0; i < 10; i ++ ) common[ 22 + i ] = ds.pending.L2.p[ i ];
+    // Bytes 32..46 stay zero — those are LED brightness / lightbar colour
+    // / player-num indicator fields that we explicitly don't touch.
+
+    try {
+
+        if ( ds.transport === 'bt' ) {
+
+            // BT report: id=0x31, payload 74 bytes + 4-byte CRC32 trailer.
+            // First 2 bytes inside the payload are BT-specific feature
+            // flags ( 0x02 = "this report contains DualSense data", 0x00 ).
+            const payload = new Uint8Array( 78 );
+            payload[ 0 ] = 0x02;
+            payload[ 1 ] = 0x00;
+            for ( let i = 0; i < 47; i ++ ) payload[ 2 + i ] = common[ i ];
+            // CRC is computed over [0xA2 (the BT message-type byte),
+            // reportId (0x31), payload[0..73]] = 75 bytes total.
+            const seed = new Uint8Array( 1 + 1 + 74 );
+            seed[ 0 ] = 0xA2;
+            seed[ 1 ] = 0x31;
+            for ( let i = 0; i < 74; i ++ ) seed[ 2 + i ] = payload[ i ];
+            const crc = _dsCrc32( seed );
+            payload[ 74 ] = crc & 0xFF;
+            payload[ 75 ] = ( crc >>> 8 ) & 0xFF;
+            payload[ 76 ] = ( crc >>> 16 ) & 0xFF;
+            payload[ 77 ] = ( crc >>> 24 ) & 0xFF;
+            await ds.device.sendReport( 0x31, payload );
+
+        } else {
+
+            // USB report: id=0x02, raw 47-byte common payload.
+            await ds.device.sendReport( 0x02, common );
+
+        }
+
+        ds.lastFlushAt = now;
+        ds.consecutiveErrors = 0;
+        // Snapshot the just-sent state so the next flush diff has something
+        // to compare against.
+        for ( const side of [ 'L2', 'R2' ] ) {
+
+            ds.lastSent[ side ].mode = ds.pending[ side ].mode;
+            for ( let i = 0; i < 10; i ++ ) ds.lastSent[ side ].p[ i ] = ds.pending[ side ].p[ i ];
+            ds.pending[ side ].dirty = false;
+
+        }
+
+    } catch ( err ) {
+
+        ds.consecutiveErrors ++;
+        if ( ds.consecutiveErrors >= 3 ) {
+
+            ds.disabled = true;
+            console.warn( '[dualsense] disabling adaptive triggers — 3 consecutive write failures' );
+
+        }
+
+    }
+
+}
+
+// Take a fresh-from-the-picker (or getDevices()) HIDDevice and wire it up.
+// Detects transport from the device's reports, claims it, swaps the UI
+// button to the "on" indicator.
+async function _dsAttach( device ) {
+
+    if ( ! device ) return false;
+    try {
+
+        if ( ! device.opened ) await device.open();
+        ds.device = device;
+        ds.disabled = false;
+        ds.consecutiveErrors = 0;
+        // Pick transport. BT reports include id 0x31; USB has 0x02.
+        let hasBt = false, hasUsb = false;
+        for ( const r of ( device.collections?.[ 0 ]?.outputReports || [] ) ) {
+
+            if ( r.reportId === 0x31 ) hasBt = true;
+            if ( r.reportId === 0x02 ) hasUsb = true;
+
+        }
+        ds.transport = hasBt && ! hasUsb ? 'bt' : 'usb';
+        // Force a fresh flush by invalidating last-sent.
+        for ( const side of [ 'L2', 'R2' ] ) {
+
+            ds.lastSent[ side ].mode = 0xFF;
+            ds.pending[ side ].dirty = true;
+
+        }
+        device.addEventListener( 'disconnect', _dsHandleDisconnect );
+        ds.authorized = true;
+        try { localStorage.setItem( 'dualsenseAuthorized', '1' ); } catch ( _ ) {}
+        _dsUpdateButton();
+        return true;
+
+    } catch ( err ) {
+
+        console.warn( '[dualsense] attach failed:', err?.message || err );
+        ds.device = null;
+        return false;
+
+    }
+
+}
+
+function _dsHandleDisconnect() {
+
+    ds.device = null;
+    ds.consecutiveErrors = 0;
+    ds.disabled = false;
+    _dsUpdateButton();
+
+}
+
+// Permission flow: requestDevice() requires a user gesture, so we render
+// a small button into #info (matching the .volume-row styling) and let
+// the player opt in. After authorization we silently re-claim on every
+// page load via getDevices() — Chrome remembers the grant per origin.
+let _dsButtonEl = null;
+
+function _dsUpdateButton() {
+
+    if ( ! _dsButtonEl ) return;
+    if ( ds.device && ds.device.opened ) {
+
+        _dsButtonEl.textContent = '✓ triggers on';
+        _dsButtonEl.style.opacity = '0.7';
+        _dsButtonEl.disabled = true;
+
+    } else if ( _dsGamepadLooksLikeDualSense() && 'hid' in navigator ) {
+
+        _dsButtonEl.textContent = '+ adaptive triggers';
+        _dsButtonEl.style.opacity = '1';
+        _dsButtonEl.disabled = false;
+        _dsButtonEl.style.display = '';
+
+    } else {
+
+        // No DualSense in sight — keep the row hidden so non-PS players
+        // don't see a useless button.
+        _dsButtonEl.style.display = 'none';
+
+    }
+
+}
+
+function initDualsenseButton() {
+
+    if ( ! ( 'hid' in navigator ) ) return; // Safari / Firefox: no-op
+    const infoEl = document.getElementById( 'info' );
+    if ( ! infoEl ) return;
+
+    const row = document.createElement( 'div' );
+    row.className = 'volume-row';
+    row.style.justifyContent = 'flex-end';
+
+    const btn = document.createElement( 'button' );
+    btn.type = 'button';
+    btn.textContent = '+ adaptive triggers';
+    btn.style.cssText = [
+        'background: rgba(255,255,255,0.08)',
+        'color: #FFCB47',
+        'border: 1px solid rgba(255,203,71,0.35)',
+        'padding: 2px 8px',
+        'border-radius: 3px',
+        'font: inherit',
+        'font-size: 10px',
+        'cursor: pointer',
+        'pointer-events: auto'
+    ].join( ';' );
+    btn.style.display = 'none'; // shown by _dsUpdateButton when DS pad seen
+
+    btn.addEventListener( 'click', async () => {
+
+        try {
+
+            const devices = await navigator.hid.requestDevice( { filters: DS_FILTERS } );
+            if ( devices && devices[ 0 ] ) await _dsAttach( devices[ 0 ] );
+
+        } catch ( err ) {
+
+            console.warn( '[dualsense] picker failed:', err?.message || err );
+
+        }
+
+    } );
+
+    row.appendChild( btn );
+    // Park the button under the RUM slider so the order in #info is
+    // VOL → RUM → triggers — same column, same vibe.
+    const allRows = infoEl.querySelectorAll( '.volume-row' );
+    const anchor = allRows.length ? allRows[ allRows.length - 1 ] : null;
+    if ( anchor && anchor.nextSibling ) infoEl.insertBefore( row, anchor.nextSibling );
+    else infoEl.appendChild( row );
+
+    _dsButtonEl = btn;
+    _dsUpdateButton();
+
+    // Re-evaluate visibility whenever a gamepad goes in / out — the
+    // window-level listeners already fire renderControlsCheatsheet, we
+    // piggyback off the same events for symmetry.
+    window.addEventListener( 'gamepadconnected', _dsUpdateButton );
+    window.addEventListener( 'gamepaddisconnected', _dsUpdateButton );
+
+    // Silent reconnect: if we got a grant on a prior visit, Chrome will
+    // return the device from getDevices() without prompting. Bail if the
+    // grant is still scoped to a device that's currently unplugged.
+    if ( localStorage.getItem( 'dualsenseAuthorized' ) === '1' ) {
+
+        navigator.hid.getDevices().then( ( list ) => {
+
+            const dev = ( list || [] ).find( d => d.vendorId === 0x054C );
+            if ( dev ) _dsAttach( dev );
+            else _dsUpdateButton();
+
+        } ).catch( () => {} );
+
+    }
+
+    // Global disconnect listener at the navigator.hid level catches the
+    // case where the user unplugs while we hold the handle but haven't
+    // wired the per-device listener yet (race on initial getDevices).
+    navigator.hid.addEventListener( 'disconnect', ( e ) => {
+
+        if ( e.device === ds.device ) _dsHandleDisconnect();
+
+    } );
+
+}
+
+// ---------------- DualSense effect mapper ----------------
+//
+// Translates per-frame car state into the trigger states designed in the
+// spec: R2 RPM-following resistance with a rev-limiter "weapon" snap,
+// L2 brake-pressure ramp with ABS pulsing, and a few small edge events
+// (TC engage bump, reverse-engaged reminder). Everything multiplied by
+// the existing rumble.strength slider so the user keeps one master knob.
+// Rate-limiting + state diffing lives in dsFlush(), we just declare what
+// we want each frame.
+
+function updateDualsense( speed ) {
+
+    if ( ! ds.device || ds.disabled ) return;
+    // Honour the master "haptics off" slider — RUM=0 → all triggers OFF.
+    if ( rumble.strength <= 0 ) {
+
+        dsTriggerOff( 'L2' );
+        dsTriggerOff( 'R2' );
+        dsFlush();
+        return;
+
+    }
+    // Scale 0..1 so RUM=40 (the default "calm" baseline) feels right and
+    // RUM=100 adds noticeable bite without ever feeling angry.
+    const scale = Math.min( 1.5, rumble.strength * 1.5 );
+    const now = performance.now();
+
+    // ---- R2 (throttle) ---------------------------------------------------
+    // Base: feedback resistance that climbs from idle to redline, so the
+    // pull feels light at low RPM and stiffens as the tach climbs. Past
+    // redline we flip to Weapon mode for a hard wall snap — the same
+    // tactile cue you get from a real rev-limiter intervening.
+    const rpm = engine.rpm || 0;
+    const redline = engine.redline || 7500;
+    const idle = engine.idleRpm || 900;
+    const rpmNorm = Math.max( 0, Math.min( 1.2, ( rpm - idle ) / Math.max( 1, redline - idle ) ) );
+    // TC engage edge — short ~200ms bump on the throttle trigger so the
+    // player feels the cut. Decays back into the RPM curve.
+    if ( drivetrain.tc.engaged && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 200;
+    ds.prevTcEngaged = drivetrain.tc.engaged;
+    const tcBumping = now < ds.tcBumpUntil;
+
+    if ( rpm >= redline * 0.99 ) {
+
+        // Past redline: hard break at trigger pos 6 — that's the "rev
+        // limiter clack". Force capped at 8 because this is the one
+        // moment we *want* the player to feel the controller fighting back.
+        const wf = Math.round( 8 * scale );
+        dsTriggerWeapon( 'R2', 5, 7, Math.max( 4, wf ) );
+
+    } else if ( tcBumping ) {
+
+        // Tactile cue for TC cutting in. Slightly firmer than the cruise
+        // resistance, but never above 6.
+        dsTriggerFeedback( 'R2', 2, Math.round( 4 * scale ) );
+
+    } else if ( rpmNorm <= 0.05 ) {
+
+        // At/near idle: trigger free so blips feel responsive.
+        dsTriggerOff( 'R2' );
+
+    } else {
+
+        // Cruise: smooth ramp 1..6 from idle→redline.
+        const f = Math.max( 1, Math.min( 6, Math.round( 1 + rpmNorm * 5 * scale ) ) );
+        // Start position 2 keeps the first ~20% of trigger travel free —
+        // light blips don't feel notchy, only sustained throttle loads up.
+        dsTriggerFeedback( 'R2', 2, f );
+
+    }
+
+    // ---- L2 (brake) ------------------------------------------------------
+    // Pedal-feel: heavier as you push harder. ABS engagement overrides
+    // with a low-Hz vibration to imitate the pedal pulsing back at your
+    // foot during a panic stop. Reverse-engaged gives a barely-there
+    // resistance so the player remembers R is latched.
+    const brake = input.brake || 0;
+    if ( drivetrain.abs.engaged && brake > 0.15 ) {
+
+        // ABS pulse — ~10 Hz, amplitude scaled but capped low; this is
+        // information, not punishment.
+        const amp = Math.max( 2, Math.min( 6, Math.round( 4 * scale ) ) );
+        dsTriggerVibration( 'L2', 2, 10, amp );
+
+    } else if ( brake > 0.02 ) {
+
+        // Force 0..6 mapped from brake 0..1; force 8 only for full panic
+        // brake. Start position 1 = almost from the top of the pull, so
+        // even a light brake gives a confirming bit of weight.
+        const target = brake >= 0.98 ? 8 : Math.round( brake * 6 );
+        // Trail-braking bonus: when steering and braking together (the
+        // moment a real driver wants the most pedal feedback to feel the
+        // weight transfer), the trigger gets stiffer by up to +2 force.
+        // Scales with |steer| × brake so it ramps in smoothly rather than
+        // snapping on the moment the wheel moves.
+        const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
+        const trailBonus = steerMag * brake * 2;
+        const f = Math.max( 1, Math.min( 8, Math.round( ( target + trailBonus ) * scale ) ) );
+        dsTriggerFeedback( 'L2', 1, f );
+
+    } else if ( input.reverseEngaged ) {
+
+        // Very light reminder that reverse is latched. Stays out of the
+        // way until the player actually pushes the brake/throttle.
+        dsTriggerFeedback( 'L2', 2, 1 );
+
+    } else {
+
+        dsTriggerOff( 'L2' );
+
+    }
+
+    dsFlush();
+
+}
+
 // ---------------- skid marks ----------------
 
 const SKID_MAX = 800;
@@ -3244,6 +3780,15 @@ function initRumbleSlider() {
             rumble.contWeak = 0;
             rumble.contStrong = 0;
             rumble.onceEndsAt = 0;
+            // Triggers share the same master — drop them immediately so the
+            // adaptive resistance doesn't linger until the next animate tick.
+            if ( ds.device && ! ds.disabled ) {
+
+                dsTriggerOff( 'L2' );
+                dsTriggerOff( 'R2' );
+                dsFlush();
+
+            }
 
         }
 
@@ -4032,6 +4577,7 @@ async function init() {
     initSkidMarks();
     initVolumeSlider();
     initRumbleSlider();
+    initDualsenseButton();
     renderControlsCheatsheet();
     _positionStatsBelowInfo();
     window.addEventListener( 'resize', _positionStatsBelowInfo );
@@ -4146,6 +4692,7 @@ async function init() {
         if ( speedoControllerEl ) speedoControllerEl.style.display = 'block';
         if ( touch.enabled ) setTouchOverlayVisible( false ); // gamepad wins
         renderControlsCheatsheet();
+        _dsUpdateButton();
         console.log( '[gamepad] connected:', e.gamepad.id );
 
     } );
@@ -4159,6 +4706,7 @@ async function init() {
             if ( speedoControllerEl ) speedoControllerEl.style.display = 'none';
             if ( touch.enabled ) setTouchOverlayVisible( true );
             renderControlsCheatsheet();
+            _dsUpdateButton();
 
         }
 
@@ -7049,6 +7597,7 @@ function animate( time ) {
         updateBrakeLights();
         updateRumble( speed );
         rumbleTick();
+        updateDualsense( speed );
         updateSkidMarks();
 
         statsForNerds.lastDelta = delta;
