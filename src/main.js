@@ -3233,6 +3233,12 @@ async function startAudio() {
 // no asset, < 100 ms total, called every time the gear actually changes.
 function playShiftSound() {
 
+    // Calm haptic tick for every shift (manual + auto). Slightly heavier
+    // on the strong motor so it feels like a soft mechanical clunk, not
+    // an electrical buzz. Pre-checked inside rumblePulse so this is safe
+    // before audio is unlocked / on Safari / without a pad.
+    rumblePulse( 0.10, 0.18, 70 );
+
     if ( ! audio.started || ! audio.ctx || ! audio.masterGain ) return;
     const ctx = audio.ctx;
     const now = ctx.currentTime;
