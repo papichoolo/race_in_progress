@@ -843,9 +843,9 @@ const TIRE_P_GRIP_WEIGHT = 0.25;   // how much pressure deviation eats grip
 // grip drops linearly to a floor — so the player CAN lose grip by over-driving
 // (sim feel) but a stationary car never goes below baseline (no slide-on-the-spot).
 const PAC_PEAK_SLIP      = 0.14;   // ~14 % slip ratio = grip peak (typical road tyre)
-const PAC_PEAK_ANGLE     = 0.12;   // ~7° slip angle = lateral peak
-const PAC_FALLOFF        = 1.3;    // how steeply grip drops past the peak
-const PAC_GRIP_FLOOR     = 0.55;   // never less than this even at full slide
+const PAC_PEAK_ANGLE     = 0.18;   // ~10° slip angle = lateral peak (was 0.12 / 7° — too early)
+const PAC_FALLOFF        = 0.6;    // gentler past-peak falloff (was 1.3 — cliff)
+const PAC_GRIP_FLOOR     = 0.78;   // never less than 78 % grip even at full slide (was 0.55)
 const PAC_SLIP_RATIO_CAP = 2.0;    // saturation for snowy/locked wheels
 
 // Inverse-quaternion world→chassis-local vector (so we can decompose chassis
@@ -6386,6 +6386,45 @@ function applyVehicleForces( speed, dt ) {
     vehicleController.setWheelBrake( 1, w1 );
     vehicleController.setWheelBrake( 2, Math.max( w2, handbrake ) );
     vehicleController.setWheelBrake( 3, Math.max( w3, handbrake ) );
+
+    // Straight-line braking lateral assist. On a slope, gravity pulls the
+    // car sideways relative to its heading — the wheels integrate that as
+    // chassis-local +X velocity even when the player is going perfectly
+    // straight, and the slip angle grows past peak, grip collapses,
+    // car slides off into the wall at 15 km/h. This bleeds off that
+    // unintended lateral velocity whenever the player is braking with
+    // centred steering and no handbrake. Falls off above ~10 m/s so the
+    // player can still trail-brake into corners on the flat.
+    if ( input.brake >= 0.05
+        && Math.abs( input.steer ) < 0.02
+        && input.handbrake < 0.05 ) {
+
+        const v = chassis.linvel();
+        const q = chassis.rotation();
+        _worldToLocalVec( v, q, _carLocalVel );
+        const vLatLocal = _carLocalVel.x;
+        if ( Math.abs( vLatLocal ) > 0.05 ) {
+
+            const speedAssist = Math.hypot( v.x, v.y, v.z );
+            const speedFactor = speedAssist < 10
+                ? 1
+                : Math.max( 0.25, 1 - ( speedAssist - 10 ) / 30 );
+            const dampRate = 6.0 * input.brake * speedFactor;
+            const k = 1 - Math.exp( - dampRate * dt );
+            // world right-axis = quaternion-rotated (1, 0, 0)
+            const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+            const rx = 1 - 2 * ( qy * qy + qz * qz );
+            const ry = 2 * ( qx * qy + qw * qz );
+            const rz = 2 * ( qx * qz - qw * qy );
+            const reduction = k * vLatLocal;
+            chassis.setLinvel(
+                { x: v.x - reduction * rx, y: v.y - reduction * ry, z: v.z - reduction * rz },
+                true
+            );
+
+        }
+
+    }
 
     // STEERING — non-linear curve (in shapeSteer), speed-scaled mechanical
     // max, and dt-aware smoothing. Toe stays baked in as the *resting*
