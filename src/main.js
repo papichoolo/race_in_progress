@@ -1544,30 +1544,23 @@ function updateDualsense( speed ) {
     ds.prevTcEngaged = drivetrain.tc.engaged;
     const tcBumping = now < ds.tcBumpUntil;
 
+    // Event-only: the trigger is FREE by default. Only the two specific
+    // moments that actually matter to a player trip resistance. No more
+    // continuous-cruise resistance — that was causing the trigger to
+    // visibly flicker as RPM bobbed and the per-frame force re-quantised.
     if ( rpm >= redline * 0.99 ) {
 
-        // Rev limiter: a noticeable wall but not a full lock. Reduced
-        // from full force 255 → 160 so the pedal still moves with effort.
-        dsTriggerWeapon( 'R2', 180, 220, 160 );
+        // Rev limiter: noticeable wall, force 130. The "shift NOW" cue.
+        dsTriggerWeapon( 'R2', 180, 220, 130 );
 
     } else if ( tcBumping ) {
 
-        // TC engage burst: short 12 Hz vibration so the player notices
-        // a slip event without the controller fighting them.
-        dsTriggerVibration( 'R2', 30, 12, Math.round( 110 * scale ) );
-
-    } else if ( load <= 0.05 ) {
-
-        // Idle / coast — let the trigger be free so blips are responsive.
-        dsTriggerOff( 'R2' );
+        // TC engage burst: short vibration that decays over ~220 ms.
+        dsTriggerVibration( 'R2', 30, 12, Math.round( 90 * scale ) );
 
     } else {
 
-        // Cruise resistance: gentle ramp 20→100 force. Was 50→230 which
-        // made the pedal physically hard to pull all the way to full
-        // throttle. Half that, capped well below max.
-        const f = Math.max( 20, Math.min( 110, Math.round( ( 20 + load * 80 ) * scale ) ) );
-        dsTriggerFeedback( 'R2', 30, f );
+        dsTriggerOff( 'R2' );
 
     }
 
@@ -1584,17 +1577,6 @@ function updateDualsense( speed ) {
     //     the racing line.
     const brake = input.brake || 0;
     const steerMag = Math.min( 1, Math.abs( input.steer || 0 ) );
-    let wheelsOff = 0;
-    if ( typeof vehicleController !== 'undefined' && vehicleController && typeof vehicleController.wheelIsInContact === 'function' ) {
-
-        for ( let i = 0; i < 4; i ++ ) {
-
-            if ( ! vehicleController.wheelIsInContact( i ) ) wheelsOff ++;
-
-        }
-
-    }
-    const offTrack = wheelsOff >= 3 && speed > 4;
 
     if ( testActive ) {
 
@@ -1602,36 +1584,24 @@ function updateDualsense( speed ) {
         // raw force on L2 so the player can confirm the protocol works.
         dsTriggerFeedback( 'L2', 20, ds.testForceL2 | 0 );
 
-    } else if ( drivetrain.abs.engaged && brake > 0.15 ) {
+    // Same event-only philosophy for the brake: free trigger normally,
+    // resistance ONLY when ABS engages or under a hard panic brake.
+    } else if ( drivetrain.abs.engaged && brake > 0.4 ) {
 
-        // ABS pulse — 12 Hz vibration but at moderate force so the
-        // player still gets useful brake control. Was 180-255 (near
-        // max) which pinned the trigger and made trail-braking through
-        // ABS impossible.
-        const absForce = Math.round( ( 90 + brake * 40 ) * scale );
-        dsTriggerVibration( 'L2', 20, 12, Math.max( 40, Math.min( 140, absForce ) ) );
+        // ABS pulse — 12 Hz vibration, moderate force so the player
+        // still has brake authority. Only fires under sustained brake
+        // (was triggering on 0.15 which made every light tap pulse).
+        const absForce = Math.round( 100 * scale );
+        dsTriggerVibration( 'L2', 30, 12, Math.max( 60, Math.min( 130, absForce ) ) );
 
-    } else if ( brake > 0.02 ) {
+    } else if ( brake > 0.75 ) {
 
-        // Pedal feel: progressive but light. Range 20→120 + small trail
-        // brake bonus (up to +25). Previous 60→255 with +70 trail bonus
-        // pinned the trigger solid and the player couldn't modulate the
-        // brake — they want pedal *feel*, not a brick wall.
-        const trailBonus = steerMag * brake * 25;
-        const target = 20 + brake * 100 + trailBonus; // 20..145 pre-clamp
-        const f = Math.max( 15, Math.min( 150, Math.round( target * scale ) ) );
-        dsTriggerFeedback( 'L2', 20, f );
-
-    } else if ( offTrack ) {
-
-        // Surface texture: very light vibration when wheels lift —
-        // information, not a wall.
-        dsTriggerVibration( 'L2', 40, 8, Math.round( 60 * scale ) );
-
-    } else if ( input.reverseEngaged ) {
-
-        // Light reverse-latched reminder.
-        dsTriggerFeedback( 'L2', 60, Math.round( 30 * scale ) );
+        // Hard panic-brake only: light resistance over the back of the
+        // pull + a small trail-brake bump if cornering. Below 0.75 the
+        // trigger is completely free so the player has full modulation.
+        const trailBonus = steerMag * 20;
+        const f = Math.max( 25, Math.min( 90, Math.round( ( 40 + trailBonus ) * scale ) ) );
+        dsTriggerFeedback( 'L2', 60, f );
 
     } else {
 
