@@ -1219,6 +1219,39 @@ function _dsHandleDisconnect() {
 
 }
 
+// Explicit user-triggered detach. Different from the OS-side disconnect
+// path — we need to (a) tell the controller to release both triggers so
+// they don't stay stuck stiff after we close the HID handle, (b) clear
+// the persisted authorization flag so reloads don't silently re-claim
+// the controller.
+async function _dsDetach() {
+
+    if ( ! ds.device ) { _dsUpdateButton(); return; }
+    try {
+
+        // Force-flush an OFF report for both triggers so the controller
+        // doesn't keep the last resistance/vibration state after we
+        // release it.
+        dsTriggerOff( 'L2' );
+        dsTriggerOff( 'R2' );
+        ds.lastFlushAt = 0; // bypass the rate-limit
+        await dsFlush();
+        if ( ds.device.opened ) await ds.device.close();
+
+    } catch ( err ) {
+
+        console.warn( '[dualsense] detach error:', err?.message || err );
+
+    }
+    try { localStorage.removeItem( 'dualsenseAuthorized' ); } catch ( _ ) {}
+    ds.device = null;
+    ds.authorized = false;
+    ds.disabled = false;
+    ds.consecutiveErrors = 0;
+    _dsUpdateButton();
+
+}
+
 // Permission flow: requestDevice() requires a user gesture, so we render
 // a small button into #info (matching the .volume-row styling) and let
 // the player opt in. After authorization we silently re-claim on every
@@ -1230,9 +1263,13 @@ function _dsUpdateButton() {
     if ( ! _dsButtonEl ) return;
     if ( ds.device && ds.device.opened ) {
 
-        _dsButtonEl.textContent = '✓ triggers on';
-        _dsButtonEl.style.opacity = '0.7';
-        _dsButtonEl.disabled = true;
+        // Click in this state calls _dsDetach() — see the click handler
+        // in initDualsenseButton. Stays enabled so the player can turn
+        // it off without unplugging the controller.
+        _dsButtonEl.textContent = '✓ triggers on  (click to turn off)';
+        _dsButtonEl.style.opacity = '1';
+        _dsButtonEl.disabled = false;
+        _dsButtonEl.style.display = '';
 
     } else if ( _dsGamepadLooksLikeDualSense() && 'hid' in navigator ) {
 
@@ -1279,6 +1316,16 @@ function initDualsenseButton() {
 
     btn.addEventListener( 'click', async () => {
 
+        // Toggle: if a device is already open, the click is a request
+        // to turn triggers OFF (forces flush + closes the HID handle +
+        // clears the persisted authorization). Otherwise it pops the
+        // device picker.
+        if ( ds.device && ds.device.opened ) {
+
+            await _dsDetach();
+            return;
+
+        }
         try {
 
             const devices = await navigator.hid.requestDevice( { filters: DS_FILTERS } );
