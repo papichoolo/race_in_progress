@@ -3598,7 +3598,7 @@ const MAPS = {
         spawnRot: { x: 0.0165, y: - 0.0934, z: - 0.0017, w: 0.9955 },
         renderRadius: 1500,
         dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
-        carScale: 1.35
+        carScale: 0.945
     },
 };
 let currentMapId = 'nurburgring';
