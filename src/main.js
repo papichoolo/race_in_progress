@@ -967,14 +967,12 @@ const ds = {
     revLimitCooldownUntil: 0, // earliest time a new rev-limit buzz may fire
     prevShiftCd: 0,           // last frame's transmission.shiftCooldown
     shiftTickUntil: 0,        // R2 paddle-shift detent end time (ms)
+    tcCooldownUntil: 0,       // earliest time wheelspin buzz may re-arm
     kerbHitUntil: 0,          // L2 kerb-impact bump end time (ms)
     prevLatSlip: false,       // last frame's lateral-slip-active flag
     latSlipUntil: 0,          // R2 lateral-slide buzz end time (ms)
-    prevSusp: [ 0, 0, 0, 0 ], // per-wheel suspension force last frame
-    lastR2Mode: 0,            // last R2 mode byte we requested (anti-flicker)
-    lastL2Mode: 0,            // last L2 mode byte we requested
-    lastR2ModeAt: 0,          // ms when lastR2Mode was last set
-    lastL2ModeAt: 0           // ms when lastL2Mode was last set
+    latSlipCooldownUntil: 0,  // earliest time slide buzz may re-arm
+    prevSusp: [ 0, 0, 0, 0 ]  // per-wheel suspension force last frame
 };
 
 // Sony's HID filter — covers the DualSense USB IDs we've seen in the wild.
@@ -1076,16 +1074,14 @@ function resetDualsenseState() {
     ds.prevSusp[ 2 ] = 0;
     ds.prevSusp[ 3 ] = 0;
     ds.tcBumpUntil = 0;
+    ds.tcCooldownUntil = 0;
     ds.absPulseUntil = 0;
     ds.revLimitUntil = 0;
     ds.revLimitCooldownUntil = 0;
     ds.shiftTickUntil = 0;
     ds.kerbHitUntil = 0;
     ds.latSlipUntil = 0;
-    ds.lastR2Mode = 0;
-    ds.lastL2Mode = 0;
-    ds.lastR2ModeAt = 0;
-    ds.lastL2ModeAt = 0;
+    ds.latSlipCooldownUntil = 0;
     dsTriggerOff( 'L2' );
     dsTriggerOff( 'R2' );
 
@@ -1492,8 +1488,9 @@ function initDualsenseButton() {
 // All cues are EVENT-driven (no continuous cruise resistance), so both
 // triggers are fully free 95% of the time and the player keeps modulation
 // authority. Forces are capped low (continuous ≤ ~110, momentary ≤ ~130).
-// Mode hold (HOLD_MS) prevents the rapid mode-switching that produced
-// felt "flicker" in earlier passes.
+// Each cue is gated by its *Until window + a re-arm cooldown so threshold-
+// bobbing near slip/slide boundaries can't fire it every frame, and the
+// shift-tick is promoted above ambient cues so a gear change is always felt.
 //
 // R2 (throttle pedal):
 //   • Rev limiter         — 14 Hz buzz, like the engine slamming against
@@ -1533,7 +1530,6 @@ function updateDualsense( speed ) {
     }
     const scale = Math.min( 1.5, rumble.strength * 1.5 );
     const now = performance.now();
-    const HOLD_MS = 80;  // anti-flicker mode-hold
 
     // -------- read game state --------
     const rpm = engine.rpm || 0;
@@ -1576,11 +1572,22 @@ function updateDualsense( speed ) {
         ds.prevSusp[ i ] = susp;
 
     }
-    if ( kerbSpike > 12000 ) ds.kerbHitUntil = Math.max( ds.kerbHitUntil, now + 120 );
+    // Kerb hit — high threshold so road bumps + spawn re-grounding don't
+    // false-positive (20 kN ≈ a real curbstone strike, not a pothole).
+    if ( kerbSpike > 20000 ) ds.kerbHitUntil = Math.max( ds.kerbHitUntil, now + 120 );
 
-    // Wheelspin event — TC engaged OR a driven tyre is past peak slip.
-    const wheelspin = drivetrain.tc.engaged || maxDriveSlip > 0.22;
-    if ( wheelspin && ! ds.prevTcEngaged ) ds.tcBumpUntil = now + 250;
+    // Wheelspin event — TC engaged OR a driven tyre is past 0.35 slip
+    // (well past peak, so a launch isn't constantly retriggering).
+    // 700 ms re-arm cooldown stops the on/off bobbing of slip ratio
+    // around the threshold from masking the whole R2 channel with
+    // continuous vibration.
+    const wheelspin = drivetrain.tc.engaged || maxDriveSlip > 0.35;
+    if ( wheelspin && ! ds.prevTcEngaged && now >= ds.tcCooldownUntil ) {
+
+        ds.tcBumpUntil = now + 220;
+        ds.tcCooldownUntil = now + 700;
+
+    }
     ds.prevTcEngaged = wheelspin;
 
     // ABS active — hold the cue for 100 ms past release so it doesn't
@@ -1598,108 +1605,94 @@ function updateDualsense( speed ) {
     }
 
     // Paddle-shift click — rising edge of transmission.shiftCooldown.
+    // 110 ms duration so it's actually felt, not blinked past.
     const shiftCd = transmission.shiftCooldown || 0;
-    if ( shiftCd > 0 && ds.prevShiftCd <= 0 ) ds.shiftTickUntil = now + 70;
+    if ( shiftCd > 0 && ds.prevShiftCd <= 0 ) ds.shiftTickUntil = now + 110;
     ds.prevShiftCd = shiftCd;
 
-    // Lateral chassis slide — only when actually moving and NOT braking
-    // (L2 owns the cue under braking via ABS / pedal feel).
-    const lateralSliding = maxLatSlip > 0.22 && speedKmh > 18 && brake < 0.3;
-    if ( lateralSliding && ! ds.prevLatSlip ) ds.latSlipUntil = now + 220;
+    // Lateral chassis slide — only when actually drifting hard (slip 0.40+,
+    // not the noisy 0.22 floor), and NOT braking (L2 owns the cue under
+    // braking via ABS / pedal feel). 900 ms cooldown so threshold-bobbing
+    // can't keep this firing.
+    const lateralSliding = maxLatSlip > 0.40 && speedKmh > 22 && brake < 0.3;
+    if ( lateralSliding && ! ds.prevLatSlip && now >= ds.latSlipCooldownUntil ) {
+
+        ds.latSlipUntil = now + 220;
+        ds.latSlipCooldownUntil = now + 900;
+
+    }
     ds.prevLatSlip = lateralSliding;
 
     if ( scale < 0.05 ) {
 
         dsTriggerOff( 'L2' );
         dsTriggerOff( 'R2' );
-        ds.lastL2Mode = 0;
-        ds.lastR2Mode = 0;
         dsFlush();
         return;
 
     }
 
-    // ===== R2 priority chain: rev-limit > wheelspin > shift-click > slide > off =====
-    function setR2( mode, fn ) {
-
-        if ( mode !== ds.lastR2Mode && now - ds.lastR2ModeAt < HOLD_MS && ds.lastR2Mode !== 0 ) {
-
-            // A high-priority cue (rev-limiter or wheelspin vibration, both
-            // mode 0x06) is always allowed to pre-empt a lower-priority
-            // section-resistance cue (mode 0x01) inside the anti-flicker hold.
-            if ( ! ( mode === 0x06 && ds.lastR2Mode === 0x01 ) ) return;
-
-        }
-        fn();
-        if ( mode !== ds.lastR2Mode ) { ds.lastR2Mode = mode; ds.lastR2ModeAt = now; }
-
-    }
-
+    // ===== R2 priority chain =====
+    // Order:
+    //   1. rev-limit  (engine slamming the limiter — can't be missed)
+    //   2. shift-tick (DELIBERATE player action — must always be felt;
+    //                  promoted above ambient cues so wheelspin/slide
+    //                  buzz never masks a gear-change detent)
+    //   3. wheelspin  (ambient, can be drowned out by a shift event)
+    //   4. slide      (ambient)
+    // No mode-hold gate: each cue is already time-windowed via its *Until
+    // timer, and event re-arm cooldowns (tcCooldownUntil / latSlipCooldownUntil)
+    // prevent rapid threshold-bobbing from causing felt flicker.
     if ( now < ds.revLimitUntil ) {
 
         // Rev-limiter buzz: 14 Hz, starts at pos 60/255 (only triggers
         // if foot is actually on the gas). Force capped 130 so it's
         // clearly felt but never blocks the pedal.
         const lf = Math.max( 90, Math.min( 130, Math.round( 110 * scale ) ) );
-        setR2( 0x06, () => dsTriggerVibration( 'R2', 60, 14, lf ) );
-
-    } else if ( now < ds.tcBumpUntil ) {
-
-        // Wheelspin buzz: 12 Hz across back half of pull (pos 100+) so
-        // it only fires when player is actually pressing hard.
-        const f = Math.max( 60, Math.min( 100, Math.round( 80 * scale ) ) );
-        setR2( 0x06, () => dsTriggerVibration( 'R2', 100, 12, f ) );
+        dsTriggerVibration( 'R2', 60, 14, lf );
 
     } else if ( now < ds.shiftTickUntil ) {
 
-        // Paddle-shift click: very narrow band of section resistance
-        // (mode 0x01) at the pulled-back position so the player feels
-        // a tactile "snap" through their finger when the gear engages.
-        const f = Math.max( 45, Math.min( 90, Math.round( 70 * scale ) ) );
-        setR2( 0x01, () => dsTriggerFeedback( 'R2', 130, f ) );
+        // Paddle-shift click: section resistance at the pulled-back
+        // position so the player feels a tactile "snap" when the gear
+        // engages. Force bumped 70→100 + duration 70→110 ms so it's
+        // unambiguous even in the middle of slip/slide activity.
+        const f = Math.max( 70, Math.min( 130, Math.round( 100 * scale ) ) );
+        dsTriggerFeedback( 'R2', 130, f );
+
+    } else if ( now < ds.tcBumpUntil ) {
+
+        // Wheelspin buzz: 12 Hz across back half of pull (pos 100+).
+        const f = Math.max( 60, Math.min( 100, Math.round( 80 * scale ) ) );
+        dsTriggerVibration( 'R2', 100, 12, f );
 
     } else if ( now < ds.latSlipUntil ) {
 
-        // Chassis sliding sideways: gentle 8 Hz buzz, force ~50. Just
-        // information — "you're not pointing where you think you are".
+        // Chassis sliding sideways: gentle 8 Hz buzz, force ~50.
         const f = Math.max( 35, Math.min( 70, Math.round( 50 * scale ) ) );
-        setR2( 0x06, () => dsTriggerVibration( 'R2', 80, 8, f ) );
+        dsTriggerVibration( 'R2', 80, 8, f );
 
     } else {
 
         dsTriggerOff( 'R2' );
-        if ( ds.lastR2Mode !== 0 ) { ds.lastR2Mode = 0; ds.lastR2ModeAt = now; }
 
     }
 
-    // ===== L2 priority chain: ABS > kerb > pedal-pressure > off =====
-    function setL2( mode, fn ) {
-
-        if ( mode !== ds.lastL2Mode && now - ds.lastL2ModeAt < HOLD_MS && ds.lastL2Mode !== 0 ) {
-
-            // ABS (vibration) is safety-critical — always allowed to pre-empt.
-            if ( ! ( mode === 0x06 && ds.lastL2Mode !== 0x06 ) ) return;
-
-        }
-        fn();
-        if ( mode !== ds.lastL2Mode ) { ds.lastL2Mode = mode; ds.lastL2ModeAt = now; }
-
-    }
-
+    // ===== L2 priority chain (no mode-hold; *Until timers gate each cue) =====
     if ( now < ds.absPulseUntil && brake > 0.30 ) {
 
         // ABS engaging — 12 Hz pulse from near top of pull (pos 25),
         // force scales with brake input (light tap < panic stomp).
         // Real brake pedals do this exact thing during ABS modulation.
         const absForce = Math.max( 70, Math.min( 110, Math.round( ( 60 + 50 * brake ) * scale ) ) );
-        setL2( 0x06, () => dsTriggerVibration( 'L2', 25, 12, absForce ) );
+        dsTriggerVibration( 'L2', 25, 12, absForce );
 
     } else if ( now < ds.kerbHitUntil ) {
 
         // Kerb-impact bump — short section resistance at mid-pull, force
         // up to 110. Feels like the kerb rattling up through the pedal.
         const kf = Math.max( 60, Math.min( 110, Math.round( 80 * scale ) ) );
-        setL2( 0x01, () => dsTriggerFeedback( 'L2', 60, kf ) );
+        dsTriggerFeedback( 'L2', 60, kf );
 
     } else if ( brake > 0.55 ) {
 
@@ -1711,12 +1704,11 @@ function updateDualsense( speed ) {
         const trailBonus = Math.min( 35, steerMag * brake * 35 );
         const target = ( brake - 0.55 ) * 200;  // 0 at 0.55 → 90 at 1.0
         const f = Math.max( 25, Math.min( 100, Math.round( ( target + trailBonus ) * scale ) ) );
-        setL2( 0x01, () => dsTriggerFeedback( 'L2', 80, f ) );
+        dsTriggerFeedback( 'L2', 80, f );
 
     } else {
 
         dsTriggerOff( 'L2' );
-        if ( ds.lastL2Mode !== 0 ) { ds.lastL2Mode = 0; ds.lastL2ModeAt = now; }
 
     }
 
