@@ -404,6 +404,7 @@ function initCarToast() {
     // Persistent top-right badge: sits above the keybind cheatsheet. Rounded
     // square edges (4px) to match the rest of the dark overlays.
     carBadgeEl = document.createElement( 'div' );
+    carBadgeEl.className = 'car-badge-desktop';
     carBadgeEl.style.cssText = [
         'position:absolute', 'top:10px', 'right:10px',
         'padding:6px 12px', 'background:rgba(0,0,0,0.55)',
@@ -1405,7 +1406,7 @@ function initDualsenseButton() {
     if ( ! infoEl ) return;
 
     const row = document.createElement( 'div' );
-    row.className = 'volume-row';
+    row.className = 'volume-row desktop-only';
     row.style.justifyContent = 'flex-end';
 
     const btn = document.createElement( 'button' );
@@ -3796,6 +3797,7 @@ function initMultiplayer() {
     multiplayer.playerName = _localPlayerName();
 
     const root = document.createElement( 'div' );
+    root.className = 'mp-root-desktop';
     root.style.cssText = [
         'position:absolute', 'bottom:82px', 'left:10px',
         'z-index:5', 'font:12px Monospace', 'color:#fff',
@@ -3822,6 +3824,15 @@ function _btnStyle() {
 }
 
 function _renderMultiplayerUI() {
+
+    // Mirror to mobile UI so the drawer chip + open MP modal sheet stay
+    // in sync with room state changes (peers joining, race starting, etc.).
+    if ( typeof device !== 'undefined' && device.touchOnly ) {
+
+        if ( device.drawerOpen ) _renderMobileDrawer();
+        if ( device.mpModalOpen ) _renderMobileMpModal();
+
+    }
 
     if ( ! multiplayer.rootEl ) return;
     const root = multiplayer.rootEl;
@@ -4604,8 +4615,11 @@ function updateAudio( dt ) {
 const touch = {
     enabled: false,
     rootEl: null,
+    padEl: null,
     ringEl: null, thumbEl: null,
+    throttleBarEl: null, brakeBarEl: null,
     throttleFillEl: null, brakeFillEl: null,
+    clusterEl: null,
     steer: 0,
     throttle: 0,
     brake: 0,
@@ -4614,6 +4628,58 @@ const touch = {
     dragPointerId: - 1,
     dragOriginX: 0
 };
+
+// Device-class detection. `touchOnly` flips to false if we ever observe a
+// keystroke (so 2-in-1 laptops with both touchscreens and keyboards stay on
+// the desktop UI). `portrait` / `smallScreen` are read from viewport size
+// and re-evaluated on every resize / orientationchange.
+const device = {
+    touchOnly: false,
+    portrait: false,
+    smallScreen: false,
+    keyboardSeen: false,
+    mobileBuilt: false,        // set once we've inserted the hamburger + drawer
+    drawerOpen: false,
+    mpModalOpen: false,
+    // DOM handles for the mobile UI we own.
+    hamburgerEl: null,
+    drawerEl: null,
+    drawerBackdropEl: null,
+    fpsChipEl: null,
+    mpModalEl: null,
+    mpChipEl: null
+};
+
+function _isTouchOnlyDevice() {
+
+    // Prefer the coarse-pointer + no-hover signal — that's the cleanest mark
+    // of a true touch-only handset. Laptops with touchscreens still report
+    // hover:hover and pointer:fine because of their trackpad / mouse.
+    const coarse = window.matchMedia && window.matchMedia( '(pointer: coarse)' ).matches;
+    const noHover = window.matchMedia && window.matchMedia( '(hover: none)' ).matches;
+    const hasTouchAPI = ( 'ontouchstart' in window ) || navigator.maxTouchPoints > 0;
+    // Conservative: require BOTH coarse pointer AND no-hover AND a touch API.
+    if ( coarse && noHover && hasTouchAPI ) return true;
+    return false;
+
+}
+
+function _updateDeviceState() {
+
+    const wasTouch = device.touchOnly;
+    const wasPortrait = device.portrait;
+    device.portrait = window.innerHeight > window.innerWidth;
+    device.smallScreen = Math.min( window.innerWidth, window.innerHeight ) < 600;
+    // If we've ever seen a keystroke this session, the user has a keyboard —
+    // never mark touchOnly even on a touchscreen laptop.
+    if ( device.keyboardSeen ) device.touchOnly = false;
+    else device.touchOnly = _isTouchOnlyDevice();
+    document.body.classList.toggle( 'is-mobile', device.touchOnly );
+    document.body.classList.toggle( 'is-portrait', device.touchOnly && device.portrait );
+    document.body.classList.toggle( 'is-landscape', device.touchOnly && ! device.portrait );
+    return ( wasTouch !== device.touchOnly ) || ( wasPortrait !== device.portrait );
+
+}
 
 // Stats-for-nerds (F3-style) panel.
 const statsForNerds = {
@@ -5329,14 +5395,17 @@ async function init() {
     clock = new THREE.Clock();
 
     stats = new Stats();
+    stats.dom.classList.add( 'desktop-only' );
     document.body.appendChild( stats.dom );
 
     fpsLabel = document.createElement( 'div' );
+    fpsLabel.className = 'fps-pill-desktop';
     fpsLabel.style.cssText = 'position:absolute;bottom:10px;left:10px;padding:4px 8px;background:rgba(0,0,0,0.55);color:#fff;font:12px Monospace;border-radius:4px;z-index:1';
     fpsLabel.textContent = 'detecting refresh rate...';
     document.body.appendChild( fpsLabel );
 
     posLabel = document.createElement( 'div' );
+    posLabel.className = 'pos-label-desktop';
     posLabel.style.cssText = 'position:absolute;bottom:10px;right:10px;padding:4px 8px;background:rgba(0,0,0,0.55);color:#fff;font:12px Monospace;border-radius:4px;z-index:1;min-width:220px;text-align:right';
     posLabel.textContent = 'pos: —     (P to copy)';
     document.body.appendChild( posLabel );
@@ -5364,6 +5433,10 @@ async function init() {
     renderControlsCheatsheet();
     _positionStatsBelowInfo();
     window.addEventListener( 'resize', _positionStatsBelowInfo );
+    // Final mobile layout pass — runs even when not touchOnly so the
+    // .is-mobile / .is-portrait body classes are correctly absent on
+    // desktop. Also wires the hamburger drawer if applicable.
+    applyMobileLayout();
 
     // Audio cannot autoplay without a user gesture — browsers block it. We
     // listen broadly so *any* interaction (key, click, tap, scroll, focus)
@@ -5378,6 +5451,21 @@ async function init() {
     window.addEventListener( 'keydown', ( event ) => {
 
         if ( event.repeat ) return; // edges only for some actions; held state for pedals tracked below
+
+        // First real keystroke means there's a physical keyboard — flip out
+        // of mobile mode on touchscreen laptops where _isTouchOnlyDevice()
+        // matched on first paint.
+        if ( ! device.keyboardSeen ) {
+
+            device.keyboardSeen = true;
+            if ( device.touchOnly ) {
+
+                _updateDeviceState();
+                applyMobileLayout();
+
+            }
+
+        }
 
         const k = event.key;
         if ( k === 'w' || k === 'W' ) input.keyW = true;
@@ -5496,6 +5584,15 @@ async function init() {
     } );
 
     window.addEventListener( 'resize', onWindowResize, false );
+    // Orientation flips on iOS can fire `orientationchange` BEFORE the
+    // window dimensions update, so we also re-run onWindowResize after a
+    // short delay. Cheap; idempotent.
+    window.addEventListener( 'orientationchange', () => {
+
+        onWindowResize();
+        setTimeout( onWindowResize, 200 );
+
+    } );
 
 }
 
@@ -6236,9 +6333,11 @@ function updateSpeedometer( speed ) {
 
 function shouldShowTouch() {
 
-    const hasTouch = ( 'ontouchstart' in window ) || navigator.maxTouchPoints > 0;
-    const hasMouse = window.matchMedia && window.matchMedia( '(hover: hover) and (pointer: fine)' ).matches;
-    return hasTouch && ! hasMouse;
+    // Re-checks the current device class — `device.touchOnly` is kept up to
+    // date on every resize / first-keystroke, and we never want to render
+    // the touch overlay on a real desktop with a keyboard.
+    _updateDeviceState();
+    return device.touchOnly;
 
 }
 
@@ -6246,13 +6345,16 @@ function _touchHoldBtn( label, fontSize, onDown, onUp ) {
 
     const b = document.createElement( 'div' );
     b.textContent = label;
+    // 56×56 default — comfortably above the 44pt iOS / 48dp Android minima.
     b.style.cssText = [
-        'width:52px', 'height:52px', 'border-radius:10px',
-        'background:rgba(0,0,0,0.5)', 'color:#fff', 'font-family:Monospace',
+        'width:56px', 'height:56px', 'border-radius:14px',
+        'background:rgba(0,0,0,0.55)', 'color:#fff', 'font-family:Monospace',
         'display:flex', 'align-items:center', 'justify-content:center',
         `font-size:${ fontSize }px`, 'pointer-events:auto', 'user-select:none',
         '-webkit-user-select:none', 'touch-action:none',
-        'border:1px solid rgba(255,255,255,0.18)', 'transition:transform 60ms,background 60ms'
+        'border:1px solid rgba(255,255,255,0.18)',
+        'box-shadow:0 4px 12px rgba(0,0,0,0.35)',
+        'transition:transform 60ms,background 60ms'
     ].join( ';' );
     let pid = - 1;
     b.addEventListener( 'pointerdown', ( e ) => {
@@ -6350,7 +6452,17 @@ function _bindPedal( bar, fill, kindKey ) {
 
 function initTouchControls() {
 
-    if ( ! shouldShowTouch() ) return;
+    // Always update device state first so applyMobileLayout reads fresh
+    // dimensions, even on a desktop browser (no-op there).
+    _updateDeviceState();
+    if ( ! shouldShowTouch() ) {
+
+        // Still build the mobile UI scaffolding if the device classes
+        // demand it later (e.g., user shrinks a touch laptop). For now,
+        // just bail — the overlay is gated on touchOnly anyway.
+        return;
+
+    }
     touch.enabled = true;
 
     const root = document.createElement( 'div' );
@@ -6359,18 +6471,21 @@ function initTouchControls() {
     document.body.appendChild( root );
     touch.rootEl = root;
 
-    // ── floating drag-pad on the left half ──
+    // ── floating drag-pad ── covers the bottom-left zone (where the left
+    // thumb naturally lands). Its exact rect is set in applyMobileLayout
+    // depending on orientation.
     const pad = document.createElement( 'div' );
-    pad.style.cssText = 'position:absolute;left:0;top:60px;bottom:120px;width:50%;pointer-events:auto;touch-action:none';
+    pad.style.cssText = 'position:absolute;pointer-events:auto;touch-action:none';
     root.appendChild( pad );
+    touch.padEl = pad;
 
     const ring = document.createElement( 'div' );
-    ring.style.cssText = 'position:absolute;width:120px;height:120px;border-radius:50%;border:2px solid rgba(255,255,255,0.55);background:rgba(0,0,0,0.18);display:none;pointer-events:none;transform:translate(-50%,-50%)';
+    ring.style.cssText = 'position:absolute;width:130px;height:130px;border-radius:50%;border:2px solid rgba(255,255,255,0.55);background:rgba(0,0,0,0.18);display:none;pointer-events:none;transform:translate(-50%,-50%)';
     root.appendChild( ring );
     touch.ringEl = ring;
 
     const thumb = document.createElement( 'div' );
-    thumb.style.cssText = 'position:absolute;width:54px;height:54px;border-radius:50%;background:rgba(255,255,255,0.88);display:none;pointer-events:none;transform:translate(-50%,-50%);box-shadow:0 2px 10px rgba(0,0,0,0.4)';
+    thumb.style.cssText = 'position:absolute;width:60px;height:60px;border-radius:50%;background:rgba(255,255,255,0.88);display:none;pointer-events:none;transform:translate(-50%,-50%);box-shadow:0 2px 10px rgba(0,0,0,0.4)';
     root.appendChild( thumb );
     touch.thumbEl = thumb;
 
@@ -6422,61 +6537,723 @@ function initTouchControls() {
     pad.addEventListener( 'pointerup', padRelease );
     pad.addEventListener( 'pointercancel', padRelease );
 
-    // ── pedals (right side) ──
+    // ── pedals ── positions set in applyMobileLayout.
     const throttle = _touchPedal( '#FFCB47' );
-    throttle.bar.style.right = '20px';
-    throttle.bar.style.bottom = '90px';
     root.appendChild( throttle.bar );
     _bindPedal( throttle.bar, throttle.fill, 'throttle' );
+    touch.throttleBarEl = throttle.bar;
     touch.throttleFillEl = throttle.fill;
 
     const brake = _touchPedal( '#E04141' );
-    brake.bar.style.right = '116px';
-    brake.bar.style.bottom = '90px';
     root.appendChild( brake.bar );
     _bindPedal( brake.bar, brake.fill, 'brake' );
+    touch.brakeBarEl = brake.bar;
     touch.brakeFillEl = brake.fill;
 
-    // ── 2×2 cluster above the pedals ──
+    // ── vertical cluster of HB / ↑ / ↓ — sits between pedals and steer pad
+    // along the right edge. Position set in applyMobileLayout.
     const cluster = document.createElement( 'div' );
-    cluster.style.cssText = 'position:absolute;right:20px;bottom:340px;display:grid;grid-template-columns:52px 52px;gap:8px;pointer-events:none';
+    cluster.style.cssText = 'position:absolute;display:flex;flex-direction:column;gap:10px;pointer-events:none';
     root.appendChild( cluster );
+    touch.clusterEl = cluster;
 
-    const hb = _touchHoldBtn( 'HB', 13,
+    const hb = _touchHoldBtn( 'HB', 14,
         () => { touch.handbrake = 1; },
         () => { touch.handbrake = 0; } );
-    const shiftUp = _touchTapBtn( '↑', 22, () => { if ( transmission.mode === 'manual' ) manualShift( 1 ); } );
-    const cam = _touchTapBtn( 'CAM', 11, () => cycleCameraMode() );
-    const shiftDn = _touchTapBtn( '↓', 22, () => { if ( transmission.mode === 'manual' ) manualShift( - 1 ); } );
-    cluster.appendChild( hb );
-    cluster.appendChild( shiftUp );
-    cluster.appendChild( cam );
-    cluster.appendChild( shiftDn );
+    const shiftUp = _touchTapBtn( '↑', 24, () => { if ( transmission.mode === 'manual' ) manualShift( 1 ); } );
+    const shiftDn = _touchTapBtn( '↓', 24, () => { if ( transmission.mode === 'manual' ) manualShift( - 1 ); } );
+    cluster.append( shiftUp, hb, shiftDn );
 
-    // ── utility row top-center ──
-    const utility = document.createElement( 'div' );
-    utility.style.cssText = 'position:absolute;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:8px;pointer-events:none';
-    root.appendChild( utility );
-
-    const resetBtn = _touchTapBtn( 'RESET', 10, () => {
-
-        input.keyR = true;
-        setTimeout( () => { input.keyR = false; }, 80 );
-
-    } );
-    resetBtn.style.width = '64px';
-    resetBtn.style.height = '36px';
-    const modeBtn = _touchTapBtn( 'A·M', 11, () => toggleTransmissionMode() );
-    modeBtn.style.width = '52px';
-    modeBtn.style.height = '36px';
-    utility.appendChild( resetBtn );
-    utility.appendChild( modeBtn );
+    // First-time layout pass so positions are correct on initial paint.
+    applyMobileLayout();
 
 }
 
 function setTouchOverlayVisible( v ) {
 
     if ( touch.rootEl ) touch.rootEl.style.display = v ? 'block' : 'none';
+
+}
+
+// ---------------- mobile layout (hamburger / drawer / fps chip / MP modal) ----------------
+//
+// applyMobileLayout() is the single entry-point for switching the HUD
+// between desktop and mobile, AND between portrait and landscape. It is
+// safe to call repeatedly (idempotent) and runs on every resize /
+// orientationchange / first-keystroke. DOM for the mobile-only widgets is
+// lazily built once on first need then re-positioned on each call.
+
+function _ensureMobileChrome() {
+
+    if ( device.mobileBuilt ) return;
+    device.mobileBuilt = true;
+
+    // Tiny FPS chip top-left. Mirrors fpsLabel.textContent every 500ms when
+    // the chip is visible — cheap, keeps the "X fps · Yk tris" string the
+    // game writes to the desktop pill visible on mobile too.
+    const fps = document.createElement( 'div' );
+    fps.className = 'm-fps mobile-only';
+    fps.textContent = '...';
+    document.body.appendChild( fps );
+    device.fpsChipEl = fps;
+    setInterval( () => {
+
+        if ( ! device.fpsChipEl || ! device.touchOnly ) return;
+        const src = ( typeof fpsLabel !== 'undefined' && fpsLabel ) ? fpsLabel.textContent : '';
+        device.fpsChipEl.textContent = src || '';
+
+    }, 500 );
+
+    // Hamburger button top-right.
+    const ham = document.createElement( 'div' );
+    ham.className = 'm-hamburger mobile-only';
+    ham.textContent = '≡';
+    ham.setAttribute( 'aria-label', 'menu' );
+    ham.addEventListener( 'click', () => _toggleMobileDrawer( true ) );
+    document.body.appendChild( ham );
+    device.hamburgerEl = ham;
+
+    // Backdrop + drawer.
+    const backdrop = document.createElement( 'div' );
+    backdrop.className = 'm-drawer-backdrop';
+    backdrop.addEventListener( 'click', () => _toggleMobileDrawer( false ) );
+    document.body.appendChild( backdrop );
+    device.drawerBackdropEl = backdrop;
+
+    const drawer = document.createElement( 'div' );
+    drawer.className = 'm-drawer';
+    document.body.appendChild( drawer );
+    device.drawerEl = drawer;
+
+    _renderMobileDrawer();
+
+    // MP modal (full-width sheet from bottom). Built once, rendered on
+    // demand via _renderMobileMpModal.
+    const mpModal = document.createElement( 'div' );
+    mpModal.className = 'm-mp-modal';
+    mpModal.addEventListener( 'click', ( e ) => {
+
+        if ( e.target === mpModal ) _toggleMobileMpModal( false );
+
+    } );
+    const mpSheet = document.createElement( 'div' );
+    mpSheet.className = 'm-mp-sheet';
+    mpModal.appendChild( mpSheet );
+    document.body.appendChild( mpModal );
+    device.mpModalEl = mpModal;
+    device.mpModalSheetEl = mpSheet;
+
+}
+
+function _toggleMobileDrawer( open ) {
+
+    if ( ! device.drawerEl ) return;
+    device.drawerOpen = open;
+    device.drawerEl.classList.toggle( 'open', open );
+    device.drawerBackdropEl.classList.toggle( 'open', open );
+    if ( open ) _renderMobileDrawer(); // refresh dynamic state (room code, etc.)
+
+}
+
+function _toggleMobileMpModal( open ) {
+
+    if ( ! device.mpModalEl ) return;
+    device.mpModalOpen = open;
+    device.mpModalEl.classList.toggle( 'open', open );
+    if ( open ) _renderMobileMpModal();
+
+}
+
+function _renderMobileDrawer() {
+
+    if ( ! device.drawerEl ) return;
+    const d = device.drawerEl;
+    d.innerHTML = '';
+
+    const close = document.createElement( 'div' );
+    close.className = 'm-close';
+    close.textContent = '×';
+    close.addEventListener( 'click', () => _toggleMobileDrawer( false ) );
+    d.appendChild( close );
+
+    const title = document.createElement( 'div' );
+    title.style.cssText = 'font-size:14px;color:#FFCB47;letter-spacing:2px;font-weight:700;margin-bottom:6px';
+    title.textContent = 'MENU';
+    d.appendChild( title );
+
+    // ── Car / car cycle ──
+    const carH = document.createElement( 'h4' ); carH.textContent = 'Car'; d.appendChild( carH );
+    const carRow = document.createElement( 'div' );
+    carRow.className = 'm-row';
+    const carName = document.createElement( 'span' );
+    carName.style.cssText = 'color:#FFCB47;font-weight:700;letter-spacing:1.5px';
+    carName.textContent = ( typeof currentCar !== 'undefined' && currentCar ) ? currentCar.name.toUpperCase() : '—';
+    const carBtns = document.createElement( 'div' );
+    carBtns.style.cssText = 'display:flex;gap:8px';
+    const prevCar = _drawerBtn( '←', () => { cycleCar( - 1 ); _renderMobileDrawer(); } );
+    prevCar.style.minWidth = '44px';
+    const nextCar = _drawerBtn( '→', () => { cycleCar( 1 ); _renderMobileDrawer(); } );
+    nextCar.style.minWidth = '44px';
+    carBtns.append( prevCar, nextCar );
+    carRow.append( carName, carBtns );
+    d.appendChild( carRow );
+
+    // ── Transmission ──
+    const txH = document.createElement( 'h4' ); txH.textContent = 'Transmission'; d.appendChild( txH );
+    const txRow = document.createElement( 'div' );
+    txRow.className = 'm-btn-row';
+    const isAuto = typeof transmission !== 'undefined' && transmission.mode === 'automatic';
+    const autoBtn = _drawerBtn( 'AUTO', () => {
+
+        if ( typeof transmission !== 'undefined' && transmission.mode !== 'automatic' ) toggleTransmissionMode();
+        _renderMobileDrawer();
+
+    }, isAuto );
+    const manBtn = _drawerBtn( 'MANUAL', () => {
+
+        if ( typeof transmission !== 'undefined' && transmission.mode !== 'manual' ) toggleTransmissionMode();
+        _renderMobileDrawer();
+
+    }, ! isAuto );
+    txRow.append( autoBtn, manBtn );
+    d.appendChild( txRow );
+
+    // ── Map ──
+    const mapH = document.createElement( 'h4' ); mapH.textContent = 'Map'; d.appendChild( mapH );
+    const mapGrid = document.createElement( 'div' );
+    mapGrid.className = 'm-btn-row';
+    const maps = [
+        [ 'Nordschleife', 'nurburgring' ],
+        [ 'GP', 'nurburgring_gp' ],
+        [ 'Spa', 'spa' ],
+        [ 'Suzuka', 'suzuka' ]
+    ];
+    for ( const [ label, id ] of maps ) {
+
+        const active = ( typeof currentMapId !== 'undefined' ) && currentMapId === id;
+        mapGrid.appendChild( _drawerBtn( label, () => {
+
+            if ( typeof swapMap === 'function' ) swapMap( id );
+            _toggleMobileDrawer( false );
+
+        }, active ) );
+
+    }
+    d.appendChild( mapGrid );
+
+    // ── Camera + Reset ──
+    const carH2 = document.createElement( 'h4' ); carH2.textContent = 'View'; d.appendChild( carH2 );
+    const vRow = document.createElement( 'div' );
+    vRow.className = 'm-btn-row';
+    vRow.appendChild( _drawerBtn( 'CAMERA', () => { if ( typeof cycleCameraMode === 'function' ) cycleCameraMode(); } ) );
+    vRow.appendChild( _drawerBtn( 'RESET CAR', () => {
+
+        input.keyR = true;
+        setTimeout( () => { input.keyR = false; }, 80 );
+        _toggleMobileDrawer( false );
+
+    } ) );
+    d.appendChild( vRow );
+
+    const tRow = document.createElement( 'div' );
+    tRow.className = 'm-btn-row';
+    const mmOn = typeof minimap !== 'undefined' && !! minimap.enabled;
+    tRow.appendChild( _drawerBtn( mmOn ? 'MINIMAP ON' : 'MINIMAP OFF', () => {
+
+        if ( typeof toggleMinimap === 'function' ) toggleMinimap();
+        _renderMobileDrawer();
+
+    }, mmOn ) );
+    const snOn = typeof statsForNerds !== 'undefined' && !! statsForNerds.enabled;
+    tRow.appendChild( _drawerBtn( snOn ? 'STATS ON' : 'STATS OFF', () => {
+
+        if ( typeof toggleStatsForNerds === 'function' ) toggleStatsForNerds();
+        _renderMobileDrawer();
+
+    }, snOn ) );
+    d.appendChild( tRow );
+
+    // ── Audio + rumble ──
+    const audH = document.createElement( 'h4' ); audH.textContent = 'Audio'; d.appendChild( audH );
+    const volRow = document.createElement( 'div' );
+    volRow.className = 'm-row';
+    const volLbl = document.createElement( 'span' ); volLbl.textContent = 'Volume';
+    const vol = document.createElement( 'input' );
+    vol.type = 'range'; vol.min = '0'; vol.max = '1'; vol.step = '0.01';
+    vol.className = 'm-slider';
+    vol.value = String( ( typeof audio !== 'undefined' && audio.masterVolume ) || 0 );
+    vol.addEventListener( 'input', () => {
+
+        const v = parseFloat( vol.value );
+        if ( typeof audio !== 'undefined' ) {
+
+            audio.masterVolume = v;
+            if ( audio.masterGain ) audio.masterGain.gain.value = v;
+
+        }
+        try { localStorage.setItem( 'masterVolume', String( v ) ); } catch ( _ ) {}
+
+    } );
+    volRow.append( volLbl, vol );
+    d.appendChild( volRow );
+
+    // ── Multiplayer chip ──
+    const mpH = document.createElement( 'h4' ); mpH.textContent = 'Multiplayer'; d.appendChild( mpH );
+    const mpRow = document.createElement( 'div' );
+    mpRow.className = 'm-btn-row';
+    if ( typeof multiplayer !== 'undefined' && multiplayer.room ) {
+
+        const peers = multiplayer.room.peers ? multiplayer.room.peers() : [];
+        mpRow.appendChild( _drawerBtn( `ROOM ${ multiplayer.room.roomCode }`, () => {
+
+            _toggleMobileDrawer( false );
+            _toggleMobileMpModal( true );
+
+        }, true ) );
+        mpRow.appendChild( _drawerBtn( `${ peers.length + 1 } PLAYER${ peers.length === 0 ? '' : 'S' }`, () => {
+
+            _toggleMobileDrawer( false );
+            _toggleMobileMpModal( true );
+
+        } ) );
+
+    } else {
+
+        mpRow.appendChild( _drawerBtn( 'MAKE ROOM', () => {
+
+            if ( typeof _createRoom === 'function' ) _createRoom();
+            _renderMobileDrawer();
+
+        }, true ) );
+        mpRow.appendChild( _drawerBtn( 'JOIN ROOM', () => {
+
+            _toggleMobileDrawer( false );
+            _toggleMobileMpModal( true );
+            _renderMobileMpModal( /* showJoinForm */ true );
+
+        } ) );
+
+    }
+    d.appendChild( mpRow );
+
+    // Footer hint.
+    const foot = document.createElement( 'div' );
+    foot.style.cssText = 'margin-top:18px;opacity:0.45;font-size:10px;line-height:1.5;letter-spacing:0.5px';
+    foot.textContent = 'Tap outside to close. Settings persist locally.';
+    d.appendChild( foot );
+
+}
+
+function _drawerBtn( label, onTap, active ) {
+
+    const b = document.createElement( 'div' );
+    b.className = 'm-btn' + ( active ? ' primary' : '' );
+    b.textContent = label;
+    b.addEventListener( 'click', ( e ) => { e.stopPropagation(); onTap(); } );
+    return b;
+
+}
+
+function _renderMobileMpModal( showJoinForm ) {
+
+    if ( ! device.mpModalSheetEl ) return;
+    const sheet = device.mpModalSheetEl;
+    sheet.innerHTML = '';
+
+    const header = document.createElement( 'div' );
+    header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:14px';
+    const ttl = document.createElement( 'div' );
+    ttl.style.cssText = 'font-size:14px;color:#FFCB47;letter-spacing:2px;font-weight:700';
+    ttl.textContent = 'MULTIPLAYER';
+    const cls = document.createElement( 'div' );
+    cls.textContent = '×';
+    cls.style.cssText = 'width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:8px;background:rgba(255,255,255,0.06);font-size:20px;cursor:pointer';
+    cls.addEventListener( 'click', () => _toggleMobileMpModal( false ) );
+    header.append( ttl, cls );
+    sheet.appendChild( header );
+
+    if ( typeof multiplayer === 'undefined' ) {
+
+        const m = document.createElement( 'div' );
+        m.style.opacity = '0.6';
+        m.textContent = 'multiplayer not initialized';
+        sheet.appendChild( m );
+        return;
+
+    }
+
+    if ( ! multiplayer.room ) {
+
+        // Make / join controls + join code input.
+        const row = document.createElement( 'div' );
+        row.className = 'm-btn-row';
+        row.style.gap = '10px';
+        const make = _drawerBtn( 'MAKE ROOM', () => {
+
+            if ( typeof _createRoom === 'function' ) _createRoom();
+            setTimeout( _renderMobileMpModal, 50 );
+
+        }, true );
+        const join = _drawerBtn( 'JOIN', () => { /* handled by input */ } );
+        row.append( make );
+        sheet.appendChild( row );
+
+        const joinWrap = document.createElement( 'div' );
+        joinWrap.style.cssText = 'display:flex;gap:8px;margin-top:14px';
+        const inp = document.createElement( 'input' );
+        inp.type = 'text';
+        inp.placeholder = 'room code';
+        inp.maxLength = 5;
+        inp.style.cssText = 'flex:1;padding:14px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:#fff;font:14px Monospace;text-transform:uppercase;letter-spacing:2px;min-height:44px;box-sizing:border-box';
+        inp.addEventListener( 'keydown', ( e ) => e.stopPropagation() );
+        inp.addEventListener( 'keyup', ( e ) => e.stopPropagation() );
+        const submit = () => {
+
+            const code = inp.value.trim().toUpperCase();
+            if ( code.length < 3 ) return;
+            if ( typeof _joinRoom === 'function' ) _joinRoom( code );
+            setTimeout( _renderMobileMpModal, 50 );
+
+        };
+        join.addEventListener( 'click', submit );
+        joinWrap.append( inp, join );
+        sheet.appendChild( joinWrap );
+        if ( showJoinForm ) setTimeout( () => inp.focus(), 50 );
+        return;
+
+    }
+
+    // In-room view.
+    const peers = multiplayer.room.peers();
+
+    const codeRow = document.createElement( 'div' );
+    codeRow.style.cssText = 'display:flex;align-items:center;gap:10px;padding:14px;background:rgba(255,203,71,0.08);border:1px solid rgba(255,203,71,0.35);border-radius:12px;margin-bottom:12px';
+    const codeLbl = document.createElement( 'span' );
+    codeLbl.style.cssText = 'opacity:0.7;font-size:11px;letter-spacing:1.5px';
+    codeLbl.textContent = 'ROOM';
+    const codeVal = document.createElement( 'span' );
+    codeVal.style.cssText = 'color:#FFCB47;font-weight:700;font-size:22px;letter-spacing:3px;flex:1';
+    codeVal.textContent = multiplayer.room.roomCode;
+    const copy = document.createElement( 'div' );
+    copy.className = 'm-btn primary';
+    copy.style.flex = '0 0 auto';
+    copy.style.padding = '10px 14px';
+    copy.textContent = 'COPY LINK';
+    copy.addEventListener( 'click', () => {
+
+        const url = ( typeof _shareUrl === 'function' ) ? _shareUrl( multiplayer.room.roomCode ) : multiplayer.room.roomCode;
+        try {
+
+            navigator.clipboard?.writeText( url ).then( () => {
+
+                copy.textContent = 'COPIED';
+                setTimeout( () => { copy.textContent = 'COPY LINK'; }, 1100 );
+
+            } );
+
+        } catch ( _ ) {}
+
+    } );
+    codeRow.append( codeLbl, codeVal, copy );
+    sheet.appendChild( codeRow );
+
+    // Status line.
+    const stat = document.createElement( 'div' );
+    stat.style.cssText = 'font-size:13px;margin:10px 0';
+    if ( multiplayer.raceState === 'lobby' ) stat.textContent = `Players: ${ peers.length + 1 }` + ( peers.length === 0 ? ' · waiting for friends...' : '' );
+    else if ( multiplayer.raceState === 'ready_check' ) {
+
+        let readyCount = multiplayer.localReady ? 1 : 0;
+        for ( const p of peers ) if ( multiplayer.readyMap.get( p )?.ready ) readyCount ++;
+        stat.textContent = `${ readyCount }/${ peers.length + 1 } ready`;
+
+    } else if ( multiplayer.raceState === 'countdown' ) stat.textContent = 'Starting...';
+    else if ( multiplayer.raceState === 'racing' ) stat.innerHTML = '<span style="color:#5DD68F">● RACING</span>';
+    else if ( multiplayer.raceState === 'finished' ) stat.innerHTML = `<span style="color:#FFCB47">★ ${ multiplayer.raceWinnerName } wins</span>`;
+    sheet.appendChild( stat );
+
+    // Player list.
+    const list = document.createElement( 'div' );
+    list.style.cssText = 'display:flex;flex-direction:column;gap:6px;margin-bottom:14px';
+    const youRow = document.createElement( 'div' );
+    youRow.style.cssText = 'display:flex;justify-content:space-between;padding:10px 12px;background:rgba(255,255,255,0.04);border-radius:8px;font-size:12px';
+    youRow.innerHTML = `<span style="color:#FFCB47">you</span><span style="opacity:0.7">${ ( typeof currentCar !== 'undefined' && currentCar ) ? currentCar.name : '' }</span>`;
+    list.appendChild( youRow );
+    for ( const p of peers ) {
+
+        const meta = multiplayer.metaByPeer && multiplayer.metaByPeer.get( p );
+        const nm = ( meta && meta.name ) || p.slice( 0, 6 );
+        const car = ( meta && typeof CARS !== 'undefined' && CARS[ meta.carIdx ] ) ? CARS[ meta.carIdx ].name : '?';
+        const row = document.createElement( 'div' );
+        row.style.cssText = 'display:flex;justify-content:space-between;padding:10px 12px;background:rgba(255,255,255,0.04);border-radius:8px;font-size:12px';
+        row.innerHTML = `<span>${ nm }</span><span style="opacity:0.6">${ car }</span>`;
+        list.appendChild( row );
+
+    }
+    sheet.appendChild( list );
+
+    // Action buttons.
+    const actions = document.createElement( 'div' );
+    actions.className = 'm-btn-row';
+
+    if ( multiplayer.raceState === 'lobby' || multiplayer.raceState === 'finished' ) {
+
+        actions.appendChild( _drawerBtn(
+            multiplayer.raceState === 'finished' ? 'RACE AGAIN' : 'START RACE',
+            () => { if ( typeof _startRace === 'function' ) _startRace(); setTimeout( _renderMobileMpModal, 50 ); },
+            true
+        ) );
+
+    } else if ( multiplayer.raceState === 'ready_check' && ! multiplayer.localReady ) {
+
+        const ready = _drawerBtn( 'READY', () => { if ( typeof _toggleReady === 'function' ) _toggleReady(); setTimeout( _renderMobileMpModal, 50 ); }, true );
+        ready.style.background = 'rgba(93,214,143,0.2)';
+        ready.style.borderColor = 'rgba(93,214,143,0.6)';
+        ready.style.color = '#5DD68F';
+        actions.appendChild( ready );
+
+    }
+
+    const leave = _drawerBtn( 'LEAVE ROOM', () => {
+
+        if ( typeof _leaveRoom === 'function' ) _leaveRoom();
+        _toggleMobileMpModal( false );
+
+    } );
+    leave.classList.add( 'danger' );
+    actions.appendChild( leave );
+
+    sheet.appendChild( actions );
+
+}
+
+function applyMobileLayout() {
+
+    // Always keep the body classes in sync; cheap if unchanged.
+    _updateDeviceState();
+    const isMobile = device.touchOnly;
+
+    if ( isMobile ) _ensureMobileChrome();
+
+    // Toggle mobile-only chrome visibility (in case state flipped).
+    if ( device.hamburgerEl ) device.hamburgerEl.style.display = isMobile ? 'flex' : 'none';
+    if ( device.fpsChipEl ) device.fpsChipEl.style.display = isMobile ? 'block' : 'none';
+
+    // If we just flipped to desktop, close any open mobile sheets.
+    if ( ! isMobile ) {
+
+        _toggleMobileDrawer( false );
+        _toggleMobileMpModal( false );
+
+    }
+
+    // Re-layout the touch overlay if it exists.
+    if ( ! touch.enabled || ! touch.rootEl ) return;
+
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const safeBottom = parseInt( getComputedStyle( document.documentElement ).getPropertyValue( '--sa-bottom' ) ) || 0;
+    const safeRight  = parseInt( getComputedStyle( document.documentElement ).getPropertyValue( '--sa-right' ) ) || 0;
+    const safeLeft   = parseInt( getComputedStyle( document.documentElement ).getPropertyValue( '--sa-left' ) ) || 0;
+
+    const portrait = device.portrait;
+    if ( touch.rootEl ) {
+
+        touch.rootEl.classList.toggle( 'is-portrait', portrait );
+        touch.rootEl.classList.toggle( 'is-landscape', ! portrait );
+
+    }
+
+    // Pedals — portrait: tall thin bars stacked vertically (throttle on top
+    // of brake) on the right edge for the right thumb. Landscape: same idea,
+    // a touch wider, side-by-side throttle+brake on the right edge.
+    const pedalW = portrait ? 80 : 96;
+    const pedalH = portrait ? Math.min( 220, Math.floor( H * 0.42 ) ) : Math.min( 200, H - 140 );
+
+    if ( touch.throttleBarEl && touch.brakeBarEl ) {
+
+        const tBar = touch.throttleBarEl;
+        const bBar = touch.brakeBarEl;
+        tBar.style.position = 'absolute';
+        bBar.style.position = 'absolute';
+        tBar.style.width = pedalW + 'px';
+        bBar.style.width = pedalW + 'px';
+        tBar.style.height = pedalH + 'px';
+        bBar.style.height = pedalH + 'px';
+
+        if ( portrait ) {
+
+            // Throttle on top, brake below; both flush to right edge.
+            const right = 14 + safeRight;
+            const bottomBrake = 14 + safeBottom;
+            const bottomThrottle = bottomBrake + pedalH + 10;
+            tBar.style.right = right + 'px'; tBar.style.left = '';
+            tBar.style.bottom = bottomThrottle + 'px'; tBar.style.top = '';
+            bBar.style.right = right + 'px'; bBar.style.left = '';
+            bBar.style.bottom = bottomBrake + 'px'; bBar.style.top = '';
+
+        } else {
+
+            // Landscape: side-by-side on right edge — throttle outer, brake inner.
+            const baseRight = 14 + safeRight;
+            const bottom = 14 + safeBottom;
+            tBar.style.right = baseRight + 'px'; tBar.style.left = '';
+            tBar.style.bottom = bottom + 'px'; tBar.style.top = '';
+            bBar.style.right = ( baseRight + pedalW + 10 ) + 'px'; bBar.style.left = '';
+            bBar.style.bottom = bottom + 'px'; bBar.style.top = '';
+
+        }
+
+    }
+
+    // HB / shift cluster — vertical stack to the left of the pedals.
+    if ( touch.clusterEl ) {
+
+        const cl = touch.clusterEl;
+        if ( portrait ) {
+
+            // Sit above the brake (which is the lower pedal) on the right edge.
+            const right = 14 + safeRight + pedalW + 12;
+            const bottom = 14 + safeBottom; // align with brake bottom roughly
+            cl.style.right = right + 'px'; cl.style.left = '';
+            cl.style.bottom = bottom + 'px'; cl.style.top = '';
+
+        } else {
+
+            // Landscape: between the inner brake column and the steer pad.
+            const right = 14 + safeRight + ( pedalW * 2 + 20 ) + 12;
+            const bottom = 14 + safeBottom;
+            cl.style.right = right + 'px'; cl.style.left = '';
+            cl.style.bottom = bottom + 'px'; cl.style.top = '';
+
+        }
+
+    }
+
+    // Steer pad — bottom-left zone, sized to half the screen height-ish.
+    if ( touch.padEl ) {
+
+        const pad = touch.padEl;
+        if ( portrait ) {
+
+            pad.style.left = ( safeLeft ) + 'px';
+            pad.style.right = '';
+            pad.style.bottom = '0';
+            pad.style.top = '';
+            pad.style.width = Math.floor( W * 0.55 ) + 'px';
+            pad.style.height = Math.floor( H * 0.45 ) + 'px';
+
+        } else {
+
+            pad.style.left = ( safeLeft ) + 'px';
+            pad.style.right = '';
+            pad.style.bottom = '0';
+            pad.style.top = '';
+            pad.style.width = Math.floor( W * 0.45 ) + 'px';
+            pad.style.height = Math.floor( H * 0.6 ) + 'px';
+
+        }
+
+    }
+
+    // Speedometer — recenter & nudge above pedal level so it never gets
+    // covered by them. We mutate the inline styles set in initSpeedometer.
+    if ( typeof speedoEl !== 'undefined' && speedoEl ) {
+
+        if ( isMobile ) {
+
+            const spdBottom = portrait
+                ? ( safeBottom + pedalH * 2 + 30 ) // above the stacked pedals
+                : ( safeBottom + 14 ); // landscape: sit at bottom-center, narrow row
+            speedoEl.style.setProperty( 'bottom', spdBottom + 'px', 'important' );
+            speedoEl.style.setProperty( 'left', '50%', 'important' );
+            speedoEl.style.setProperty( 'transform', 'translateX(-50%)', 'important' );
+            speedoEl.style.setProperty( 'padding', '6px 10px', 'important' );
+            speedoEl.style.setProperty( 'gap', '10px', 'important' );
+            speedoEl.style.setProperty( 'max-width', portrait ? `calc(100vw - ${ pedalW * 2 + 40 }px)` : '60vw', 'important' );
+            // Shrink children for portrait — the gear digit + RPM bar both
+            // dominate horizontally otherwise.
+            if ( speedoGearEl ) speedoGearEl.style.setProperty( 'font-size', '24px', 'important' );
+            if ( speedoNumEl ) speedoNumEl.style.setProperty( 'font-size', '22px', 'important' );
+            if ( speedoRpmFillEl && speedoRpmFillEl.parentElement ) {
+
+                speedoRpmFillEl.parentElement.style.setProperty( 'width', portrait ? '80px' : '120px', 'important' );
+
+            }
+
+        } else {
+
+            // Restore defaults by removing our overrides.
+            speedoEl.style.removeProperty( 'max-width' );
+            // Other overrides simply re-apply if applyMobileLayout runs in
+            // mobile mode again; they don't need clearing on desktop.
+
+        }
+
+    }
+
+    // Lap timer — keep at bottom-left, but lift above safe area + pad.
+    if ( typeof lapTimer !== 'undefined' && lapTimer && lapTimer.root ) {
+
+        if ( isMobile ) {
+
+            const lapBottom = portrait
+                ? ( safeBottom + pedalH * 2 + 80 )
+                : ( safeBottom + 80 );
+            lapTimer.root.style.setProperty( 'bottom', lapBottom + 'px', 'important' );
+            lapTimer.root.style.setProperty( 'left', ( safeLeft + 10 ) + 'px', 'important' );
+            lapTimer.root.style.setProperty( 'z-index', '20', 'important' );
+
+        } else {
+
+            lapTimer.root.style.removeProperty( 'bottom' );
+            lapTimer.root.style.removeProperty( 'left' );
+
+        }
+
+    }
+
+    // Minimap — on mobile, anchor top-left below the FPS chip (so it doesn't
+    // collide with the steer pad). Shrink for portrait small screens.
+    if ( typeof minimap !== 'undefined' && minimap && minimap.containerEl ) {
+
+        const wrap = minimap.containerEl;
+        if ( isMobile ) {
+
+            const size = portrait ? 120 : 140;
+            wrap.style.setProperty( 'width', size + 'px', 'important' );
+            wrap.style.setProperty( 'height', size + 'px', 'important' );
+            wrap.style.setProperty( 'top', ( safeBottom + 40 ) + 'px', 'important' );
+            wrap.style.setProperty( 'bottom', 'auto', 'important' );
+            wrap.style.setProperty( 'left', ( safeLeft + 8 ) + 'px', 'important' );
+            wrap.style.setProperty( 'right', 'auto', 'important' );
+            // The internal canvas still renders at its original 200×200 buffer;
+            // it'll just scale down via CSS — keeps the projection correct.
+            if ( minimap.canvas ) {
+
+                minimap.canvas.style.setProperty( 'width', size + 'px', 'important' );
+                minimap.canvas.style.setProperty( 'height', size + 'px', 'important' );
+
+            }
+
+        } else {
+
+            wrap.style.removeProperty( 'width' );
+            wrap.style.removeProperty( 'height' );
+            wrap.style.removeProperty( 'top' );
+            wrap.style.removeProperty( 'bottom' );
+            wrap.style.removeProperty( 'left' );
+            wrap.style.removeProperty( 'right' );
+            if ( minimap.canvas ) {
+
+                minimap.canvas.style.removeProperty( 'width' );
+                minimap.canvas.style.removeProperty( 'height' );
+
+            }
+
+        }
+
+    }
 
 }
 
@@ -7009,6 +7786,7 @@ function initStatsForNerds() {
     // set dynamically in _positionStatsBelowInfo() so it tracks #info's
     // height as that panel grows (volume slider, minimap toggle, etc.).
     statsForNerds.toggleBtn = document.createElement( 'div' );
+    statsForNerds.toggleBtn.className = 'stats-nerds-toggle';
     statsForNerds.toggleBtn.style.cssText = [
         'position:absolute', 'top:240px', 'right:10px',
         'padding:5px 9px', 'background:rgba(0,0,0,0.55)', 'color:#fff',
@@ -7026,6 +7804,7 @@ function initStatsForNerds() {
     // Panel. Anchored top-and-bottom so it always leaves room for the
     // speedometer / pos-pill at the bottom and content scrolls within.
     const panel = document.createElement( 'div' );
+    panel.className = 'stats-nerds-panel';
     panel.style.cssText = [
         'position:absolute', 'top:240px', 'right:10px', 'bottom:110px',
         'padding:10px 12px 12px', 'background:rgba(0,0,0,0.72)', 'color:#fff',
@@ -8296,6 +9075,12 @@ function onWindowResize() {
     camera.updateProjectionMatrix();
     renderer.setSize( window.innerWidth, window.innerHeight );
     if ( dof.composer ) dof.composer.setSize( window.innerWidth, window.innerHeight );
+    // Mobile UI: re-evaluate touchOnly + portrait/landscape and re-layout
+    // the touch overlay + speedometer / pedal positions. Cheap — flips a
+    // couple of CSS classes; never rebuilds DOM unless touchOnly itself
+    // changes.
+    if ( typeof _updateDeviceState === 'function' ) _updateDeviceState();
+    if ( typeof applyMobileLayout === 'function' ) applyMobileLayout();
 
 }
 
