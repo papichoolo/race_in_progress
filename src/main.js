@@ -1482,40 +1482,42 @@ function initDualsenseButton() {
 
 }
 
-// ---------------- DualSense effect mapper — racing pedal feel ----------------
+// ---------------- DualSense effect mapper — per-car racing-pedal feel ----------------
 //
-// What each in-game moment maps to physically on the controller.
-// All cues are EVENT-driven (no continuous cruise resistance), so both
-// triggers are fully free 95% of the time and the player keeps modulation
-// authority. Forces are capped low (continuous ≤ ~110, momentary ≤ ~130).
-// Each cue is gated by its *Until window + a re-arm cooldown so threshold-
-// bobbing near slip/slide boundaries can't fire it every frame, and the
-// shift-tick is promoted above ambient cues so a gear change is always felt.
+// What each in-game moment maps to physically on the controller. All cues
+// are EVENT-driven (no continuous cruise resistance), so both triggers are
+// fully free 95% of the time and the player keeps modulation authority.
 //
-// R2 (throttle pedal):
-//   • Rev limiter         — 14 Hz buzz, like the engine slamming against
-//                           the limiter (real ICE rev-limiters vibrate,
-//                           they don't lock the pedal).
-//   • Wheelspin / TC cut  — 12 Hz buzz across the back of pull, "tyres
-//                           clawing for grip — back off".
-//   • Paddle-shift click  — tiny section resistance mid-pull, mimics the
-//                           tactile snap of a real F1 paddle.
-//   • Lateral slide       — gentle 8 Hz buzz when the car is sliding
-//                           sideways at speed, "you're drifting".
+// Per-car personalization: every cue reads its force range / freq / startPos /
+// hold-ms / cooldown-ms / detection-threshold from `currentCar.dsProfile.*`.
+// A 1700 kg muscle car's ABS pulses slow + heavy; a 911's pulses fast + crisp.
+// The Hatchback's plastic rev limiter buzzes at 10 Hz; the F1's screams at 15.
+// See each car's `dsProfile` literal in the CARS array for the rationale.
 //
-// L2 (brake pedal):
-//   • ABS engaged         — 12 Hz pulse near the top of pull. Real brake
-//                           pedals literally pulse back at the foot when
-//                           ABS modulates. THIS IS THE SIGNATURE CUE.
-//   • Kerb impact         — sharp brief bump felt through the pedal,
-//                           like the kerb rattling up through the chassis.
-//   • Pedal pressure      — progressive resistance starting at 55% brake,
-//                           ramping with a small trail-brake bonus, so
-//                           you feel the brake bite + the load transfer
-//                           into the front tyres when cornering hard.
+// Cues (shared across cars, tuned per-car):
+//   R2 — revLimit (vibration) > shiftTick (feedback) > wheelspin (vibration) > slide (vibration)
+//   L2 — abs (vibration) > kerb (feedback) > brakePressure (progressive feedback)
 //
-// All forces are scaled by the master RUM slider; RUM=0 silences
+// FORCE-AMPLITUDE RULE (load-bearing): forces stay subtle. Per-car forceMin/
+// forceMax caps are enforced in the helper closures so no profile can blow
+// past ~130 momentary / ~110 sustained. Differentiation between cars is
+// expressed via freq / startPos / threshold / duration, NOT raw amplitude.
+//
+// All forces are also scaled by the master RUM slider; RUM=0 silences
 // everything. dsFlush() handles rate-limiting + state diffing.
+
+// Fallback profile used if currentCar.dsProfile is missing (shouldn't
+// happen — every car ships one — but defensive so a typo in a car config
+// can't silently brick the trigger feedback).
+const DS_DEFAULT_PROFILE = {
+    revLimit:      { forceMin: 90, forceMax: 130, freq: 14, startPos: 60,  holdMs: 250, cooldownMs: 400 },
+    shiftTick:     { forceMin: 45, forceMax: 90,  startPos: 130, holdMs: 70 },
+    wheelspin:     { forceMin: 60, forceMax: 100, freq: 12, startPos: 100, holdMs: 220, cooldownMs: 700, slipThreshold: 0.35 },
+    slide:         { forceMin: 35, forceMax: 70,  freq:  8, startPos: 80,  holdMs: 220, cooldownMs: 900, slipThreshold: 0.40, speedKmhMin: 22 },
+    abs:           { forceMin: 70, forceMax: 110, freq: 12, startPos: 25,  holdMs: 100, brakeThreshold: 0.30 },
+    kerb:          { forceMin: 60, forceMax: 110, startPos: 60,  holdMs: 120, suspThreshold: 20000 },
+    brakePressure: { forceMin: 25, forceMax: 100, startPos: 80,  deadzone: 0.55, ramp: 200, trailBonus: 35 }
+};
 
 function updateDualsense( speed ) {
 
@@ -1530,6 +1532,27 @@ function updateDualsense( speed ) {
     }
     const scale = Math.min( 1.5, rumble.strength * 1.5 );
     const now = performance.now();
+    const prof = ( currentCar && currentCar.dsProfile ) || DS_DEFAULT_PROFILE;
+
+    // Midpoint × master scale, clamped to per-cue [forceMin, forceMax].
+    // The clamp is load-bearing: it enforces the per-car force ceiling so a
+    // high RUM setting can't push forces past what the profile allows.
+    const _f = ( p ) => {
+
+        const mid = ( p.forceMin + p.forceMax ) * 0.5;
+        return Math.max( p.forceMin, Math.min( p.forceMax, Math.round( mid * scale ) ) );
+
+    };
+    // Ramped force: t∈[0,1] interpolates linearly between forceMin (at t=0)
+    // and forceMax (at t=1), then scaled + clamped. Used by ABS where harder
+    // brake input = stronger pulse-back.
+    const _fRamp = ( p, t ) => {
+
+        const u = Math.max( 0, Math.min( 1, t ) );
+        const raw = p.forceMin + ( p.forceMax - p.forceMin ) * u;
+        return Math.max( p.forceMin, Math.min( p.forceMax, Math.round( raw * scale ) ) );
+
+    };
 
     // -------- read game state --------
     const rpm = engine.rpm || 0;
@@ -1561,7 +1584,8 @@ function updateDualsense( speed ) {
     }
 
     // Kerb hit — sudden positive jump in any wheel's suspension load.
-    // 12 kN threshold keeps gentle road bumps from falsing.
+    // Per-car suspThreshold: F1 fires at 8 kN (22 mm of travel transmits
+    // everything), Hatchback at 26 kN (soft springs absorb the small stuff).
     let kerbSpike = 0;
     for ( let i = 0; i < 4; i ++ ) {
 
@@ -1572,53 +1596,48 @@ function updateDualsense( speed ) {
         ds.prevSusp[ i ] = susp;
 
     }
-    // Kerb hit — high threshold so road bumps + spawn re-grounding don't
-    // false-positive (20 kN ≈ a real curbstone strike, not a pothole).
-    if ( kerbSpike > 20000 ) ds.kerbHitUntil = Math.max( ds.kerbHitUntil, now + 120 );
+    if ( kerbSpike > prof.kerb.suspThreshold ) ds.kerbHitUntil = Math.max( ds.kerbHitUntil, now + prof.kerb.holdMs );
 
-    // Wheelspin event — TC engaged OR a driven tyre is past 0.35 slip
-    // (well past peak, so a launch isn't constantly retriggering).
-    // 700 ms re-arm cooldown stops the on/off bobbing of slip ratio
-    // around the threshold from masking the whole R2 channel with
-    // continuous vibration.
-    const wheelspin = drivetrain.tc.engaged || maxDriveSlip > 0.35;
+    // Wheelspin event — TC engaged OR a driven tyre past per-car slip threshold.
+    // Re-arm cooldown stops slip-ratio bobbing around the threshold from
+    // refiring the cue every frame.
+    const wheelspin = drivetrain.tc.engaged || maxDriveSlip > prof.wheelspin.slipThreshold;
     if ( wheelspin && ! ds.prevTcEngaged && now >= ds.tcCooldownUntil ) {
 
-        ds.tcBumpUntil = now + 220;
-        ds.tcCooldownUntil = now + 700;
+        ds.tcBumpUntil = now + prof.wheelspin.holdMs;
+        ds.tcCooldownUntil = now + prof.wheelspin.cooldownMs;
 
     }
     ds.prevTcEngaged = wheelspin;
 
-    // ABS active — hold the cue for 100 ms past release so it doesn't
-    // flicker on/off as ABS modulates internally.
-    if ( drivetrain.abs.engaged ) ds.absPulseUntil = now + 100;
+    // ABS active — hold the cue past release so it doesn't flicker as
+    // ABS modulates internally. Per-car holdMs (F1 60 ms crisp, Hatchback 110 ms).
+    if ( drivetrain.abs.engaged ) ds.absPulseUntil = now + prof.abs.holdMs;
     ds.prevAbsEngaged = drivetrain.abs.engaged;
 
-    // Rev limiter — vibration, NOT a wall. 250 ms buzz with a 400 ms
-    // cooldown so holding throttle at redline doesn't fire every frame.
+    // Rev limiter — per-car buzz/hold/cooldown. Cooldown ensures holding
+    // throttle at redline doesn't refire every frame.
     if ( rpm >= redline * 0.99 && now >= ds.revLimitCooldownUntil ) {
 
-        ds.revLimitUntil = now + 250;
-        ds.revLimitCooldownUntil = now + 400;
+        ds.revLimitUntil = now + prof.revLimit.holdMs;
+        ds.revLimitCooldownUntil = now + prof.revLimit.cooldownMs;
 
     }
 
     // Paddle-shift click — rising edge of transmission.shiftCooldown.
-    // 110 ms duration so it's actually felt, not blinked past.
     const shiftCd = transmission.shiftCooldown || 0;
-    if ( shiftCd > 0 && ds.prevShiftCd <= 0 ) ds.shiftTickUntil = now + 110;
+    if ( shiftCd > 0 && ds.prevShiftCd <= 0 ) ds.shiftTickUntil = now + prof.shiftTick.holdMs;
     ds.prevShiftCd = shiftCd;
 
-    // Lateral chassis slide — only when actually drifting hard (slip 0.40+,
-    // not the noisy 0.22 floor), and NOT braking (L2 owns the cue under
-    // braking via ABS / pedal feel). 900 ms cooldown so threshold-bobbing
-    // can't keep this firing.
-    const lateralSliding = maxLatSlip > 0.40 && speedKmh > 22 && brake < 0.3;
+    // Lateral chassis slide — per-car threshold + speed gate; gated off
+    // under braking so L2 cues (ABS / pedal feel) own that channel cleanly.
+    const lateralSliding = maxLatSlip > prof.slide.slipThreshold
+        && speedKmh > prof.slide.speedKmhMin
+        && brake < 0.3;
     if ( lateralSliding && ! ds.prevLatSlip && now >= ds.latSlipCooldownUntil ) {
 
-        ds.latSlipUntil = now + 220;
-        ds.latSlipCooldownUntil = now + 900;
+        ds.latSlipUntil = now + prof.slide.holdMs;
+        ds.latSlipCooldownUntil = now + prof.slide.cooldownMs;
 
     }
     ds.prevLatSlip = lateralSliding;
@@ -1632,45 +1651,28 @@ function updateDualsense( speed ) {
 
     }
 
-    // ===== R2 priority chain =====
-    // Order:
-    //   1. rev-limit  (engine slamming the limiter — can't be missed)
-    //   2. shift-tick (DELIBERATE player action — must always be felt;
-    //                  promoted above ambient cues so wheelspin/slide
-    //                  buzz never masks a gear-change detent)
-    //   3. wheelspin  (ambient, can be drowned out by a shift event)
-    //   4. slide      (ambient)
-    // No mode-hold gate: each cue is already time-windowed via its *Until
-    // timer, and event re-arm cooldowns (tcCooldownUntil / latSlipCooldownUntil)
-    // prevent rapid threshold-bobbing from causing felt flicker.
+    // ===== R2 priority chain: rev > shift > wheelspin > slide =====
+    // shift-tick sits above ambient cues so a deliberate driver action
+    // (gear change) is never masked by ambient wheelspin/slide buzz.
     if ( now < ds.revLimitUntil ) {
 
-        // Rev-limiter buzz: 14 Hz, starts at pos 60/255 (only triggers
-        // if foot is actually on the gas). Force capped 130 so it's
-        // clearly felt but never blocks the pedal.
-        const lf = Math.max( 90, Math.min( 130, Math.round( 110 * scale ) ) );
-        dsTriggerVibration( 'R2', 60, 14, lf );
+        const p = prof.revLimit;
+        dsTriggerVibration( 'R2', p.startPos, p.freq, _f( p ) );
 
     } else if ( now < ds.shiftTickUntil ) {
 
-        // Paddle-shift click: section resistance at the pulled-back
-        // position so the player feels a tactile "snap" when the gear
-        // engages. Force bumped 70→100 + duration 70→110 ms so it's
-        // unambiguous even in the middle of slip/slide activity.
-        const f = Math.max( 70, Math.min( 130, Math.round( 100 * scale ) ) );
-        dsTriggerFeedback( 'R2', 130, f );
+        const p = prof.shiftTick;
+        dsTriggerFeedback( 'R2', p.startPos, _f( p ) );
 
     } else if ( now < ds.tcBumpUntil ) {
 
-        // Wheelspin buzz: 12 Hz across back half of pull (pos 100+).
-        const f = Math.max( 60, Math.min( 100, Math.round( 80 * scale ) ) );
-        dsTriggerVibration( 'R2', 100, 12, f );
+        const p = prof.wheelspin;
+        dsTriggerVibration( 'R2', p.startPos, p.freq, _f( p ) );
 
     } else if ( now < ds.latSlipUntil ) {
 
-        // Chassis sliding sideways: gentle 8 Hz buzz, force ~50.
-        const f = Math.max( 35, Math.min( 70, Math.round( 50 * scale ) ) );
-        dsTriggerVibration( 'R2', 80, 8, f );
+        const p = prof.slide;
+        dsTriggerVibration( 'R2', p.startPos, p.freq, _f( p ) );
 
     } else {
 
@@ -1678,33 +1680,30 @@ function updateDualsense( speed ) {
 
     }
 
-    // ===== L2 priority chain (no mode-hold; *Until timers gate each cue) =====
-    if ( now < ds.absPulseUntil && brake > 0.30 ) {
+    // ===== L2 priority chain: ABS > kerb > brake-pressure =====
+    if ( now < ds.absPulseUntil && brake > prof.abs.brakeThreshold ) {
 
-        // ABS engaging — 12 Hz pulse from near top of pull (pos 25),
-        // force scales with brake input (light tap < panic stomp).
+        // ABS pulse force scales with brake input above the threshold.
         // Real brake pedals do this exact thing during ABS modulation.
-        const absForce = Math.max( 70, Math.min( 110, Math.round( ( 60 + 50 * brake ) * scale ) ) );
-        dsTriggerVibration( 'L2', 25, 12, absForce );
+        const p = prof.abs;
+        const t = ( brake - p.brakeThreshold ) / Math.max( 0.001, 1 - p.brakeThreshold );
+        dsTriggerVibration( 'L2', p.startPos, p.freq, _fRamp( p, t ) );
 
     } else if ( now < ds.kerbHitUntil ) {
 
-        // Kerb-impact bump — short section resistance at mid-pull, force
-        // up to 110. Feels like the kerb rattling up through the pedal.
-        const kf = Math.max( 60, Math.min( 110, Math.round( 80 * scale ) ) );
-        dsTriggerFeedback( 'L2', 60, kf );
+        const p = prof.kerb;
+        dsTriggerFeedback( 'L2', p.startPos, _f( p ) );
 
-    } else if ( brake > 0.55 ) {
+    } else if ( brake > prof.brakePressure.deadzone ) {
 
-        // Progressive brake-pedal pressure: dead-zone until 55% brake
-        // (real pedals also have an initial free range before the pads
-        // bite), then resistance ramps from 0 → ~90 as brake → 1.0.
-        // Trail-brake bonus stacks ≤ +35 when cornering hard so you feel
-        // the load shift forward.
-        const trailBonus = Math.min( 35, steerMag * brake * 35 );
-        const target = ( brake - 0.55 ) * 200;  // 0 at 0.55 → 90 at 1.0
-        const f = Math.max( 25, Math.min( 100, Math.round( ( target + trailBonus ) * scale ) ) );
-        dsTriggerFeedback( 'L2', 80, f );
+        // Progressive brake-pedal pressure: per-car deadzone + ramp slope,
+        // with trail-brake bonus (steerMag × brake × trailBonus) capped at
+        // trailBonus. Force clamped to per-car [forceMin, forceMax] × scale.
+        const p = prof.brakePressure;
+        const trailBonus = Math.min( p.trailBonus, steerMag * brake * p.trailBonus );
+        const target = ( brake - p.deadzone ) * p.ramp;
+        const f = Math.max( p.forceMin, Math.min( p.forceMax, Math.round( ( target + trailBonus ) * scale ) ) );
+        dsTriggerFeedback( 'L2', p.startPos, f );
 
     } else {
 
@@ -4415,7 +4414,19 @@ const CARS = [
         camberDeg: [ - 0.5, - 0.5, - 0.3, - 0.3 ], toeDeg: [ 0, 0, 0.1, - 0.1 ],
         engineInertia: 0.14, clutchStiffness: 280, lsdLocking: 0.30,
         Cd: 0.0250, Cl: 0.0000,
-        driveType: 'FWD'
+        driveType: 'FWD',
+        // Cheap-and-cheerful baseline: older 8 Hz ABS, sloppy auto detent,
+        // soft suspension swallows kerbs, open diff = brief harmless wheelspin,
+        // plastic-fizz rev limiter, firm progressive brake (66% nose bias).
+        dsProfile: {
+            revLimit:      { forceMin: 70, forceMax:  95, freq: 10, startPos: 70,  holdMs: 220, cooldownMs: 450 },
+            shiftTick:     { forceMin: 35, forceMax:  60, startPos: 120, holdMs: 95 },
+            wheelspin:     { forceMin: 45, forceMax:  70, freq:  9, startPos: 110, holdMs: 160, cooldownMs: 800, slipThreshold: 0.40 },
+            slide:         { forceMin: 30, forceMax:  55, freq:  7, startPos: 85,  holdMs: 200, cooldownMs: 1000, slipThreshold: 0.46, speedKmhMin: 28 },
+            abs:           { forceMin: 60, forceMax:  95, freq:  8, startPos: 30,  holdMs: 110, brakeThreshold: 0.32 },
+            kerb:          { forceMin: 50, forceMax:  85, startPos: 65,  holdMs: 100, suspThreshold: 26000 },
+            brakePressure: { forceMin: 30, forceMax: 100, startPos: 75,  deadzone: 0.50, ramp: 220, trailBonus: 38 }
+        }
     },
     // Muscle V8 — 1700 kg Mustang GT class; heavy nose, fat low-end torque.
     // Easy to oversteer on throttle, lazy revs, body-roll, ~230 km/h.
@@ -4437,7 +4448,21 @@ const CARS = [
         camberDeg: [ - 1, - 1, - 0.5, - 0.5 ], toeDeg: [ 0, 0, 0.1, - 0.1 ],
         engineInertia: 0.20, clutchStiffness: 340, lsdLocking: 0.55,
         Cd: 0.0235, Cl: 0.0000,
-        driveType: 'RWD'
+        driveType: 'RWD',
+        // Burnout king: 5 Hz pushrod-V8 limiter thud (slowest in fleet),
+        // ka-CLUNK shifts (deepest startPos, longest hold), wheelspin is the
+        // signature cue (slipThreshold 0.26 + 7 Hz "burning rubber" rumble +
+        // 320 ms hold so a sustained burnout reads as one event), long-throw
+        // brake pedal with fleet's biggest trail bonus for 1700 kg drama.
+        dsProfile: {
+            revLimit:      { forceMin: 90, forceMax: 125, freq:  5, startPos: 45,  holdMs: 320, cooldownMs: 450 },
+            shiftTick:     { forceMin: 55, forceMax:  95, startPos: 140, holdMs: 95 },
+            wheelspin:     { forceMin: 75, forceMax: 108, freq:  7, startPos: 90,  holdMs: 320, cooldownMs: 550, slipThreshold: 0.26 },
+            slide:         { forceMin: 45, forceMax:  80, freq:  8, startPos: 75,  holdMs: 260, cooldownMs: 750, slipThreshold: 0.34, speedKmhMin: 20 },
+            abs:           { forceMin: 70, forceMax: 105, freq: 11, startPos: 30,  holdMs: 110, brakeThreshold: 0.30 },
+            kerb:          { forceMin: 65, forceMax: 110, startPos: 55,  holdMs: 150, suspThreshold: 17000 },
+            brakePressure: { forceMin: 25, forceMax: 100, startPos: 70,  deadzone: 0.48, ramp: 175, trailBonus: 45 }
+        }
     },
     // Sport Flat-six — 1430 kg 911 GT3 class.
     // The driver's car: high-rev peaky power, sharp turn-in, rear rotation, ~290 km/h.
@@ -4459,7 +4484,21 @@ const CARS = [
         camberDeg: [ - 2.2, - 2.2, - 1.2, - 1.2 ], toeDeg: [ - 0.1, 0.1, 0.2, - 0.2 ],
         engineInertia: 0.07, clutchStiffness: 600, lsdLocking: 0.75,
         Cd: 0.0128, Cl: 0.0080,
-        driveType: 'RWD'
+        driveType: 'RWD',
+        // The scalpel: 15 Hz electronic 9200 rpm scream (capped at protocol max),
+        // crisp PDK paddle (startPos 150 — deepest, 55 ms hold — shortest),
+        // 911 rear-rotation slide cue at low threshold (0.34) and fast 10 Hz
+        // onset, carbon-ceramic ABS at protocol max 15 Hz with 80 ms hold,
+        // stiff short-travel suspension means every kerb registers (16 kN).
+        dsProfile: {
+            revLimit:      { forceMin: 90, forceMax: 125, freq: 15, startPos: 70,  holdMs: 200, cooldownMs: 350 },
+            shiftTick:     { forceMin: 55, forceMax:  95, startPos: 150, holdMs: 55 },
+            wheelspin:     { forceMin: 60, forceMax: 100, freq: 13, startPos: 115, holdMs: 180, cooldownMs: 650, slipThreshold: 0.38 },
+            slide:         { forceMin: 35, forceMax:  70, freq: 10, startPos: 85,  holdMs: 190, cooldownMs: 800, slipThreshold: 0.34, speedKmhMin: 25 },
+            abs:           { forceMin: 75, forceMax: 110, freq: 15, startPos: 22,  holdMs: 80,  brakeThreshold: 0.28 },
+            kerb:          { forceMin: 65, forceMax: 110, startPos: 65,  holdMs: 95,  suspThreshold: 16000 },
+            brakePressure: { forceMin: 25, forceMax: 100, startPos: 85,  deadzone: 0.50, ramp: 220, trailBonus: 32 }
+        }
     },
     // Rally Turbo — WRX STI class; AWD-feel grip, broad turbo plateau.
     // Strong AWD launch, soft long-travel for bumps, biggest handbrake for Scandi flicks, ~250 km/h.
@@ -4481,7 +4520,21 @@ const CARS = [
         camberDeg: [ - 1.2, - 1.2, - 1.0, - 1.0 ], toeDeg: [ 0, 0, 0.1, - 0.1 ],
         engineInertia: 0.12, clutchStiffness: 460, lsdLocking: 0.90,
         Cd: 0.0290, Cl: 0.0030,
-        driveType: 'AWD'
+        driveType: 'AWD',
+        // Gravel-spec all-rounder: AWD wheelspin is brief 11 Hz "all-four
+        // clawing" texture starting at low startPos (felt across pull), slide
+        // is the signature (early threshold 0.32 + long 280 ms hold for Scandi
+        // flicks), long-travel suspension absorbs kerbs (26 kN threshold),
+        // gritty 9 Hz ABS like brakes fighting loose surface, strong trail bonus.
+        dsProfile: {
+            revLimit:      { forceMin: 85, forceMax: 120, freq: 12, startPos: 55,  holdMs: 280, cooldownMs: 420 },
+            shiftTick:     { forceMin: 55, forceMax:  95, startPos: 125, holdMs: 85 },
+            wheelspin:     { forceMin: 60, forceMax:  95, freq: 11, startPos: 55,  holdMs: 160, cooldownMs: 850, slipThreshold: 0.32 },
+            slide:         { forceMin: 45, forceMax:  75, freq:  7, startPos: 65,  holdMs: 280, cooldownMs: 700, slipThreshold: 0.32, speedKmhMin: 20 },
+            abs:           { forceMin: 65, forceMax: 105, freq:  9, startPos: 30,  holdMs: 120, brakeThreshold: 0.28 },
+            kerb:          { forceMin: 55, forceMax:  95, startPos: 65,  holdMs: 85,  suspThreshold: 26000 },
+            brakePressure: { forceMin: 22, forceMax:  90, startPos: 85,  deadzone: 0.50, ramp: 180, trailBonus: 42 }
+        }
     },
     // Supercar V12 — Ferrari 812 class.
     // Broad NA V12, lazy spin-up (heavy crank), top-end heavy hitter, ~330 km/h.
@@ -4503,7 +4556,21 @@ const CARS = [
         camberDeg: [ - 1.8, - 1.8, - 1.0, - 1.0 ], toeDeg: [ - 0.1, 0.1, 0.2, - 0.2 ],
         engineInertia: 0.13, clutchStiffness: 620, lsdLocking: 0.80,
         Cd: 0.0182, Cl: 0.0140,
-        driveType: 'RWD'
+        driveType: 'RWD',
+        // Italian cathedral: V12 rev limiter is a deliberate 12 Hz "shoulder
+        // tap" with long 300 ms hold (heavy crank inertia), dual-clutch shift
+        // is sharp at deep startPos (145) with 55 ms snap, broad torque means
+        // wheelspin happens at higher slip threshold (0.40) but dramatically,
+        // carbon ceramic ABS at 15 Hz crisp, GT3-style controllable slide cue.
+        dsProfile: {
+            revLimit:      { forceMin: 80, forceMax: 115, freq: 12, startPos: 65,  holdMs: 300, cooldownMs: 420 },
+            shiftTick:     { forceMin: 55, forceMax:  95, startPos: 145, holdMs: 55 },
+            wheelspin:     { forceMin: 65, forceMax: 105, freq: 11, startPos: 110, holdMs: 240, cooldownMs: 750, slipThreshold: 0.40 },
+            slide:         { forceMin: 40, forceMax:  75, freq:  9, startPos: 85,  holdMs: 240, cooldownMs: 850, slipThreshold: 0.42, speedKmhMin: 35 },
+            abs:           { forceMin: 70, forceMax: 108, freq: 15, startPos: 22,  holdMs: 90,  brakeThreshold: 0.30 },
+            kerb:          { forceMin: 65, forceMax: 108, startPos: 62,  holdMs: 105, suspThreshold: 21000 },
+            brakePressure: { forceMin: 25, forceMax:  98, startPos: 82,  deadzone: 0.52, ramp: 205, trailBonus: 28 }
+        }
     },
     // F1 — V10-era open-wheeler tuned FOR THIS ENGINE, not for a sim.
     // Rationale: in our physics, mass=5 + force=235 + stiff/low suspension
@@ -4531,7 +4598,22 @@ const CARS = [
         camberDeg: [ - 2.5, - 2.5, - 1.5, - 1.5 ], toeDeg: [ - 0.1, 0.1, 0.15, - 0.15 ],
         engineInertia: 0.07, clutchStiffness: 800, lsdLocking: 1.00,
         Cd: 0.0190, Cl: 0.0420,
-        driveType: 'RWD'
+        driveType: 'RWD',
+        // Knife-edge: 15 Hz 17,500 rpm electronic scream (protocol-capped),
+        // seamless paddle = near-invisible 35 ms blip at deepest startPos
+        // (200), spool diff fires wheelspin at low 0.22 slip (instant on/off),
+        // fast 10 Hz slide cue with low 0.30 threshold (milliseconds to react),
+        // brutal kerbs through 22 mm travel (8 kN threshold), ferocious 15 Hz
+        // ABS at 70 ms, brake bites at 40% deadzone with tall ramp.
+        dsProfile: {
+            revLimit:      { forceMin: 90, forceMax: 125, freq: 15, startPos: 70,  holdMs: 200, cooldownMs: 350 },
+            shiftTick:     { forceMin: 40, forceMax:  60, startPos: 200, holdMs: 35 },
+            wheelspin:     { forceMin: 60, forceMax:  95, freq: 13, startPos: 120, holdMs: 160, cooldownMs: 550, slipThreshold: 0.22 },
+            slide:         { forceMin: 45, forceMax:  75, freq: 11, startPos: 90,  holdMs: 170, cooldownMs: 550, slipThreshold: 0.30, speedKmhMin: 30 },
+            abs:           { forceMin: 75, forceMax: 110, freq: 15, startPos: 30,  holdMs: 70,  brakeThreshold: 0.25 },
+            kerb:          { forceMin: 70, forceMax: 120, startPos: 70,  holdMs: 90,  suspThreshold: 8000 },
+            brakePressure: { forceMin: 30, forceMax: 100, startPos: 90,  deadzone: 0.40, ramp: 200, trailBonus: 25 }
+        }
     },
     // God Car — physically impossible: max grip, 10 gears, flat torque, near-instant stops.
     // Easy-mode tank, forgives every input, ~400+ km/h, perfect balance.
@@ -4559,7 +4641,21 @@ const CARS = [
         camberDeg: [ - 2, - 2, - 1, - 1 ], toeDeg: [ 0, 0, 0.05, - 0.05 ],
         engineInertia: 0.18, clutchStiffness: 900, lsdLocking: 0.90,
         Cd: 0.0165, Cl: 0.0850,
-        driveType: 'AWD'
+        driveType: 'AWD',
+        // Fantasy fastest-in-fleet: synthetic + surgical. 15 Hz screams at
+        // the protocol ceiling (rev + ABS), 10-speed shifts are 30 ms micro-
+        // blips at startPos 175, magic tyres mean wheelspin/slide thresholds
+        // sit high (0.50 / 0.52 — "you broke physics" alarms), brake bites at
+        // 45% with steep ramp + low 22 trail bonus (perfect balance, no drama).
+        dsProfile: {
+            revLimit:      { forceMin: 90, forceMax: 125, freq: 15, startPos: 70,  holdMs: 180, cooldownMs: 380 },
+            shiftTick:     { forceMin: 35, forceMax:  50, startPos: 175, holdMs: 30 },
+            wheelspin:     { forceMin: 55, forceMax:  90, freq: 14, startPos: 120, holdMs: 140, cooldownMs: 1100, slipThreshold: 0.50 },
+            slide:         { forceMin: 40, forceMax:  65, freq: 11, startPos: 100, holdMs: 180, cooldownMs: 1200, slipThreshold: 0.52, speedKmhMin: 45 },
+            abs:           { forceMin: 75, forceMax: 105, freq: 15, startPos: 20,  holdMs: 60,  brakeThreshold: 0.25 },
+            kerb:          { forceMin: 55, forceMax:  95, startPos: 70,  holdMs: 90,  suspThreshold: 28000 },
+            brakePressure: { forceMin: 25, forceMax:  95, startPos: 75,  deadzone: 0.45, ramp: 175, trailBonus: 22 }
+        }
     }
 ];
 
