@@ -5211,7 +5211,12 @@ const MAPS = {
         label: 'Nürburgring (Nordschleife)',
         path: 'textures/models/nurburgring.glb',
         spawnPos: { x: 3147.90, y: - 80.45, z: - 2733.54 },
-        spawnRot: { x: - 0.0046, y: - 0.5791, z: 0.0216, w: 0.8150 }
+        spawnRot: { x: - 0.0046, y: - 0.5791, z: 0.0216, w: 0.8150 },
+        // Asphalt material(s) used by the road-detection raycast. The GLB
+        // has only 3 merged materials ("Material" / "default" / "default_1"),
+        // and the whole drivable Nordschleife loop shares "Material". Press X
+        // in-game to enumerate any extras (e.g. pit lane / GP-link tarmac).
+        roadMaterials: [ 'Material' ]
     },
     nurburgring_gp: {
         label: 'Nürburgring GP (2022 layout)',
@@ -5222,7 +5227,11 @@ const MAPS = {
         // car still lands on the same on-asphalt point at the new scale.
         // Press P on-track if you want a tighter spawn.
         spawnPos: { x: 26.17, y: 26.07, z: 1219.19 },
-        spawnRot: { x: 0.0037, y: - 0.0175, z: 0.0121, w: - 0.9998 }
+        spawnRot: { x: 0.0037, y: - 0.0175, z: 0.0121, w: - 0.9998 },
+        // GLB packs 70 atlased materials with cryptic batch names; the main
+        // GP racing surface is index 56 ("Esdanurburgring2022681Mtl"). If we
+        // need pit lane or off-line tarmac later, X-pick more and append.
+        roadMaterials: [ 'Esdanurburgring2022681Mtl' ]
     },
     spa: {
         // Spa-Francorchamps 1992 layout — community GLB with embedded
@@ -5254,7 +5263,24 @@ const MAPS = {
         spawnRot: { x: 0.0188, y: - 0.1562, z: - 0.0036, w: - 0.9875 },
         renderRadius: 1500,
         dof: { focus: 30, aperture: 0.0000051, maxblur: 0.006 },
-        carScale: 1.5
+        carScale: 1.5,
+        // Spa community GLB splits the track into ~9 asphalt materials.
+        // road1x (confirmed via X-pick) is the main racing surface; the
+        // rest are pit lane, joining sections, and the old-layout stub.
+        // Excluded: "Meshesroadrmblb/c" (rumble strip kerbs) and
+        // "Meshesroadroadgrdx" (looks like guard-rail trim, not tarmac).
+        roadMaterials: [
+            'Meshesroadroad1x0171Mtl',
+            'Meshesroadroad2x1Mtl',
+            'Meshesroadroad3x0091Mtl',
+            'Meshesroadroadjx1Mtl',
+            'Meshesroadroadb0021Mtl',
+            'Meshesroadroadrold0021Mtl',
+            'Meshesroadroadrold20051Mtl',
+            'Meshesroadpitroadpit1Mtl',
+            'Meshesgrassxroadpitf1Mtl',
+            'Meshesgrassxroadl0011Mtl'
+        ]
     },
     suzuka: {
         // Suzuka Circuit 2001 layout — community GLB (~95 MB) with
@@ -5290,7 +5316,26 @@ const MAPS = {
         // grey) but the car drives through it. Grandstand seats elsewhere
         // also become non-collidable, which is fine — players don't drive
         // into stands and if they do, clipping is better than a wall.
-        nonCollidableMaterials: [ 'NODE.001' ]
+        nonCollidableMaterials: [ 'NODE.001' ],
+        // Suzuka GLB splits the track into ROAD01..ROAD07 + variants for the
+        // pit lane and pit-line markings. ROAD01 (confirmed via X-pick) is
+        // the main straight. Excluded: RMBL* (rumble), SKID* (skid marks
+        // overlay), GRVL* (gravel run-off), ROAD_RK_GREEN04 (green kerb).
+        roadMaterials: [
+            'ROAD01',
+            'ROAD02',
+            'ROAD03',
+            'ROAD04',
+            'ROAD05',
+            'ROAD06',
+            'ROAD07',
+            'ROADD',
+            'ROADX',
+            'PITROAD',
+            'RDPITLTA',
+            'YLOPITLTA',
+            'PITEXITLINE'
+        ]
     },
 };
 let currentMapId = 'nurburgring';
