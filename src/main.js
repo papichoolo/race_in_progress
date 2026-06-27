@@ -21,6 +21,18 @@ let clock;
 let fpsLabel, posLabel;
 let lapTimer;
 let track, trackBody, sunLight, sunTarget;
+// AI driver state. `racingLine` is the per-map waypoint loop loaded from
+// public/racing-lines/<id>.json by loadTrack(); `ai.enabled` is the L-toggle.
+// See aiUpdate() / toggleAiMode() near the bottom of the file.
+let racingLine = null;
+const ai = {
+    enabled: false,
+    closestIdx: 0,
+    lineMesh: null,
+    badgeEl: null,
+    paintedMats: new Map(),
+    paintColor: 0x9933FF
+};
 let speedoEl, speedoNumEl, speedoGearEl, speedoRpmFillEl, speedoModeEl, speedoControllerEl;
 
 // Lucide SVG icons inlined so we don't pull in the whole lucide package.
@@ -5545,6 +5557,11 @@ async function init() {
         // so they can be added to the per-map excludeMeshesNear list.
         if ( k === 'x' || k === 'X' ) pickMeshAtCrosshair();
 
+        // L — toggle AI drive. Loads the per-map racing line, paints the car
+        // purple, draws an F1-style line overlay above the road. Any human
+        // input cancels AI mode (handled in aiUpdate).
+        if ( k === 'l' || k === 'L' ) toggleAiMode();
+
         if ( k === 'h' || k === 'H' ) {
 
             if ( physicsHelper ) physicsHelper.visible = ! physicsHelper.visible;
@@ -6116,6 +6133,12 @@ async function loadTrack() {
 
     console.log( `[track] ${ totalTris.toLocaleString() } triangles, ${ chunkMeshes.length } chunks (${ ( tEnd - tStart ).toFixed( 0 ) } ms), spawn ${ spawnPoint.x.toFixed( 1 ) }, ${ spawnPoint.y.toFixed( 1 ) }, ${ spawnPoint.z.toFixed( 1 ) }` );
     if ( fpsLabel ) fpsLabel.textContent = `display ~${ fpsTarget.target }fps · ${ ( totalTris / 1000 ).toFixed( 0 ) }k tris · ${ chunkMeshes.length } chunks`;
+
+    // Load the per-map racing line for AI drive (L). Failure is non-fatal —
+    // L just shows "no line for this map" if the JSON is missing.
+    await loadRacingLine( currentMapId );
+    disposeAiLineMesh();
+    if ( ai.enabled ) buildAiLineMesh();
 
 }
 
@@ -9212,6 +9235,10 @@ function animate( time ) {
 
         updateInput( delta );
 
+        // AI overrides input.steer/throttle/brake after the human/gamepad/touch
+        // merge above, so AI mode wins until the player toggles it back off (L).
+        aiUpdate( delta );
+
         // Engine RPM is computed kinematically from wheel speed × gear ratio
         // × final drive. Smoothed slightly so gear shifts don't snap the gauge.
         const targetRpm = computeRpm( speed, transmission.gear );
@@ -9313,5 +9340,316 @@ function animate( time ) {
     renderMinimap();
 
     stats.update();
+
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AI drive (press L)
+//
+// Pure-pursuit + curvature-based speed control on a pre-baked racing line
+// (public/racing-lines/<id>.json, generated offline by scripts/extract-
+// racing-line.mjs). The line is an ordered loop of { x, z, v } waypoints
+// already optimised for minimum curvature and bounded by physics-derived
+// brake / accel caps, so the AI just has to follow it accurately.
+//
+// Each frame aiUpdate() — called immediately after updateInput() in the
+// main loop — picks a lookahead waypoint a speed-dependent distance ahead,
+// computes the angle to it in the car's local frame, and writes input.steer
+// + input.throttle + input.brake. The downstream physics pipeline (engine,
+// brake, steer-shaping) is unchanged, so the AI feels like a perfectly
+// disciplined human driver.
+//
+// Visuals: car body materials swap to bright purple, a thick magenta
+// LineLoop above the track shows the line, and a small "AI DRIVE" badge
+// appears top-centre. Any deliberate human input cancels AI mode.
+
+const _aiPickedHumanInput = () => (
+    input.keyW || input.keyS || input.keyA || input.keyD ||
+    input.arrowUp || input.arrowDown || input.arrowLeft || input.arrowRight ||
+    input.keySpace || input.keyE || ( touch.enabled && (
+        Math.abs( touch.steer ) > 0.05 || touch.throttle > 0.05 || touch.brake > 0.05
+    ) )
+);
+
+async function loadRacingLine( id ) {
+
+    racingLine = null;
+    try {
+
+        const res = await fetch( import.meta.env.BASE_URL + 'racing-lines/' + id + '.json' );
+        if ( ! res.ok ) { console.warn( `[ai] no racing-line for ${ id }` ); return; }
+        racingLine = await res.json();
+        console.log( `[ai] racing-line loaded: ${ racingLine.length } waypoints` );
+
+    } catch ( e ) { console.warn( '[ai] racing-line fetch failed', e ); }
+
+}
+
+function toggleAiMode() {
+
+    if ( ai.enabled ) {
+
+        ai.enabled = false;
+        paintCarPurple( false );
+        disposeAiLineMesh();
+        _showAiBadge( false );
+        showCarToast( 'AI off — you drive' );
+        return;
+
+    }
+
+    if ( ! racingLine || racingLine.length < 8 ) {
+
+        showCarToast( 'no racing line for this map' );
+        return;
+
+    }
+
+    // Snap closestIdx to the car's current XZ so the AI doesn't initially
+    // try to drive backwards toward waypoint 0.
+    if ( chassis ) {
+
+        const t = chassis.translation();
+        ai.closestIdx = _aiNearestIdx( t.x, t.z, 0, racingLine.length );
+
+    }
+
+    ai.enabled = true;
+    paintCarPurple( true );
+    buildAiLineMesh();
+    _showAiBadge( true );
+    showCarToast( 'AI drive engaged · press L to take back' );
+
+}
+
+function _aiNearestIdx( x, z, startIdx, scanCount ) {
+
+    let bestIdx = startIdx, bestD = Infinity;
+    const n = racingLine.length;
+    for ( let i = 0; i < scanCount; i ++ ) {
+
+        const k = ( startIdx + i ) % n;
+        const p = racingLine[ k ];
+        const dx = p.x - x, dz = p.z - z;
+        const d = dx * dx + dz * dz;
+        if ( d < bestD ) { bestD = d; bestIdx = k; }
+
+    }
+    return bestIdx;
+
+}
+
+const _aiFwd = new THREE.Vector3();
+const _aiRight = new THREE.Vector3();
+const _aiTmpQ = new THREE.Quaternion();
+
+function aiUpdate( dt ) {
+
+    if ( ! ai.enabled || ! racingLine || ! chassis ) return;
+
+    // Bail out on any deliberate human input — driver wants control back.
+    if ( _aiPickedHumanInput() ) { toggleAiMode(); return; }
+
+    const t = chassis.translation();
+    const v = chassis.linvel();
+    const speed = Math.hypot( v.x, v.z );
+
+    // Incremental closest-point search — scan ~60 waypoints forward from
+    // last frame's index, plus 6 backward for the case where physics shoved
+    // us behind the line. Cheap (O(60)/frame).
+    const n = racingLine.length;
+    const scanStart = ( ai.closestIdx + n - 6 ) % n;
+    ai.closestIdx = _aiNearestIdx( t.x, t.z, scanStart, 80 );
+
+    // Lookahead distance: faster → look further, so steering anticipates the
+    // line instead of chasing tail. Clamped to the range that gives stable
+    // pure-pursuit (too short = oscillation, too long = corner-cutting).
+    const lookAhead = THREE.MathUtils.clamp( 5 + speed * 0.45, 6, 28 );
+
+    // Walk forward along the loop accumulating arc length until ≥ lookAhead.
+    let walked = 0;
+    let idx = ai.closestIdx;
+    while ( walked < lookAhead ) {
+
+        const a = racingLine[ idx ];
+        const b = racingLine[ ( idx + 1 ) % n ];
+        walked += Math.hypot( b.x - a.x, b.z - a.z );
+        idx = ( idx + 1 ) % n;
+
+    }
+    const target = racingLine[ idx ];
+
+    // Express target in car-local frame so positive X = left of car, negative
+    // Z = ahead of car (Three.js convention matches the chassis's forward).
+    const q = chassis.rotation();
+    _aiTmpQ.set( q.x, q.y, q.z, q.w );
+    _aiFwd.set( 0, 0, - 1 ).applyQuaternion( _aiTmpQ );
+    _aiRight.set( 1, 0, 0 ).applyQuaternion( _aiTmpQ );
+    const dx = target.x - t.x, dz = target.z - t.z;
+    const lx = dx * _aiRight.x + dz * _aiRight.z;
+    const lz = - ( dx * _aiFwd.x + dz * _aiFwd.z );  // > 0 when target is in front
+
+    // Steering angle from the kinematic-bicycle pure-pursuit formula:
+    // δ = atan2(2·L·sin(α), Ld) — L is wheelbase, α is angle to target,
+    // Ld is lookahead. We invert because input.steer = +1 turns left in this
+    // codebase (see updateInput / steeringCfg).
+    const alpha = Math.atan2( lx, Math.max( 0.5, lz ) );
+    const wheelbase = 2.6;
+    const delta = Math.atan2( 2 * wheelbase * Math.sin( alpha ), Math.max( 6, lookAhead ) );
+    // Map raw wheel-angle (rad) → input.steer (-1..+1). Max steer ≈ 35°.
+    let steer = THREE.MathUtils.clamp( delta / ( 35 * Math.PI / 180 ), - 1, 1 );
+
+    // Speed target: smoothed over the few waypoints around the lookahead so
+    // we react to a *region*, not a single noisy sample.
+    let vSum = 0, vN = 0;
+    for ( let k = - 2; k <= 4; k ++ ) {
+
+        const w = racingLine[ ( idx + k + n ) % n ];
+        vSum += w.v; vN ++;
+
+    }
+    const targetV = vSum / vN;
+    const dv = targetV - speed;
+
+    let throttle = 0, brake = 0;
+    if ( dv > 0.5 ) {
+
+        // Below target: accelerate. Generous P-gain so we close the gap on
+        // straights but don't spin tyres at standstill (steeper ramp once
+        // we're rolling).
+        throttle = THREE.MathUtils.clamp( 0.3 + dv * 0.12, 0.2, 1.0 );
+
+    } else if ( dv < - 1.5 ) {
+
+        // Significantly over target: brake. Asymmetric — brakes ramp gently
+        // (avoids ABS flicker) but reach 1.0 by ~15 m/s overspeed.
+        brake = THREE.MathUtils.clamp( ( - dv - 1.5 ) * 0.08, 0.1, 1.0 );
+
+    } else {
+
+        // Within ±1 m/s of target: coast at light throttle.
+        throttle = 0.15;
+
+    }
+
+    // Trail-brake on steering: a little brake while turning helps the car
+    // rotate; cancels at very high steering angles where the front tyres
+    // would just plough.
+    const absSteer = Math.abs( steer );
+    if ( throttle < 0.1 && absSteer > 0.25 && absSteer < 0.85 ) {
+
+        brake = Math.max( brake, 0.15 * absSteer );
+
+    }
+
+    // Reverse safety: if the dot of velocity onto forward is strongly
+    // negative (we're going backwards), full brake to stop, then re-arm.
+    const vFwd = - ( v.x * _aiFwd.x + v.z * _aiFwd.z );
+    if ( vFwd < - 2 ) { throttle = 0; brake = 1.0; }
+
+    input.steerRaw = steer;
+    input.steer = steer;
+    input.throttle = throttle;
+    input.brake = brake;
+    input.handbrake = 0;
+    input.handbrakeAfterReset = false;
+
+}
+
+// ─── purple body-paint swap ───
+function paintCarPurple( on ) {
+
+    if ( ! carVisualsGroup ) return;
+    if ( on ) {
+
+        ai.paintedMats.clear();
+        carVisualsGroup.traverse( ( o ) => {
+
+            const m = o.material;
+            if ( ! m || ! m.color ) return;
+            // Skip lights and pure-black trim (windows, tyres).
+            const c = m.color.getHex();
+            if ( c === 0x000000 || c === 0xFF0000 || c === 0xFFFFFF ) return;
+            ai.paintedMats.set( m, c );
+            m.color.setHex( ai.paintColor );
+
+        } );
+
+    } else {
+
+        for ( const [ m, c ] of ai.paintedMats ) m.color.setHex( c );
+        ai.paintedMats.clear();
+
+    }
+
+}
+
+// ─── F1-style overlay: thick line above the racing line ───
+function buildAiLineMesh() {
+
+    if ( ! racingLine || ai.lineMesh ) return;
+    // Raycast straight down at each waypoint against the chunked track so the
+    // line sits ~30 cm above tarmac on hilly tracks (Spa / Nordschleife)
+    // instead of clipping through the road or floating into the sky.
+    const ray = new THREE.Raycaster();
+    const down = new THREE.Vector3( 0, - 1, 0 );
+    const pts = new Array( racingLine.length );
+    const baseY = ( typeof spawnPoint !== 'undefined' && spawnPoint ) ? spawnPoint.y : 0;
+    for ( let i = 0; i < racingLine.length; i ++ ) {
+
+        const w = racingLine[ i ];
+        ray.set( new THREE.Vector3( w.x, baseY + 200, w.z ), down );
+        ray.far = 500;
+        let y = baseY + 0.4;
+        if ( track ) {
+
+            const hits = ray.intersectObject( track, true );
+            if ( hits.length ) y = hits[ 0 ].point.y + 0.4;
+
+        }
+        pts[ i ] = new THREE.Vector3( w.x, y, w.z );
+
+    }
+    // Catmull-Rom + TubeGeometry gives a smooth, fixed-width ribbon that
+    // reads cleanly in chase-cam without depending on screen-space line
+    // widths (which WebGL doesn't actually support beyond 1 px).
+    const curve = new THREE.CatmullRomCurve3( pts, true, 'catmullrom', 0.5 );
+    const tubularSegments = Math.min( 4000, racingLine.length * 2 );
+    const tube = new THREE.TubeGeometry( curve, tubularSegments, 0.6, 6, true );
+    const mat = new THREE.MeshBasicMaterial( {
+        color: ai.paintColor,
+        transparent: true,
+        opacity: 0.78,
+        depthWrite: false
+    } );
+    ai.lineMesh = new THREE.Mesh( tube, mat );
+    ai.lineMesh.renderOrder = 999;
+    scene.add( ai.lineMesh );
+
+}
+
+function disposeAiLineMesh() {
+
+    if ( ! ai.lineMesh ) return;
+    scene.remove( ai.lineMesh );
+    ai.lineMesh.geometry.dispose();
+    ai.lineMesh.material.dispose();
+    ai.lineMesh = null;
+
+}
+
+function _showAiBadge( on ) {
+
+    if ( ! ai.badgeEl ) {
+
+        const el = document.createElement( 'div' );
+        el.id = 'ai-badge';
+        el.textContent = 'AI DRIVE';
+        el.style.cssText = 'position:fixed;top:14px;left:50%;transform:translateX(-50%);background:rgba(153,51,255,0.18);color:#D6B3FF;font:600 13px Monospace;letter-spacing:2px;padding:6px 14px;border:1px solid rgba(153,51,255,0.55);border-radius:4px;z-index:9999;display:none;pointer-events:none';
+        document.body.appendChild( el );
+        ai.badgeEl = el;
+
+    }
+    ai.badgeEl.style.display = on ? 'block' : 'none';
 
 }
