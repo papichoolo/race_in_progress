@@ -954,6 +954,46 @@ function updateBrakeLights() {
 
 }
 
+// ---------------- god-car fluid RGB underglow + road light ----------------
+//
+// Each tagged neon mesh has its own MeshStandardMaterial with userData.godNeon
+// and userData.hueOffset. The PointLight beneath the chassis is tagged with
+// userData.godRoadLight. This function advances a shared hue phase and
+// rewrites material.color, material.emissive, and the light colour every
+// frame so the whole car flows through the rainbow. Only runs when the
+// God Car is selected — other cars early-return.
+let _godNeonPhase = 0;
+const _godNeonTmp = new THREE.Color();
+function updateGodNeon( dt ) {
+
+    if ( ! carVisualsGroup ) return;
+    if ( ! currentCar || currentCar.name !== 'God Car' ) return;
+
+    // ~6 seconds per full rotation through the hue wheel.
+    _godNeonPhase = ( _godNeonPhase + ( dt || 1 / 60 ) * 0.17 ) % 1;
+    let primaryHue = _godNeonPhase;
+
+    carVisualsGroup.traverse( ( o ) => {
+
+        if ( o.material && o.material.userData && o.material.userData.godNeon ) {
+
+            const h = ( primaryHue + ( o.material.userData.hueOffset || 0 ) / ( Math.PI * 2 ) + 1 ) % 1;
+            _godNeonTmp.setHSL( h, 1.0, 0.55 );
+            o.material.color.copy( _godNeonTmp );
+            o.material.emissive.copy( _godNeonTmp );
+
+        }
+        if ( o.isLight && o.userData && o.userData.godRoadLight ) {
+
+            _godNeonTmp.setHSL( primaryHue, 1.0, 0.55 );
+            o.color.copy( _godNeonTmp );
+
+        }
+
+    } );
+
+}
+
 // ---------------- controller rumble (Web Gamepad Haptic Actuator) ----------------
 //
 // "Art of Rally" style calm haptics: a barely-there continuous surface
@@ -8396,88 +8436,44 @@ function _addTaillight( parent, geom, mat, pos, isReverse ) {
 
 function _buildHatchback( parent ) {
 
-    // Boxy 3-door commuter — think MkII Golf / late-80s Civic.
-    // Upright cabin, short bonnet, vertical hatch, plastic black bumpers.
+    // Clean simple hatchback — yellow body with a small black cabin band on top.
+    // Short bonnet, flat solid-yellow rear (no rear glass cutout). Minimal trim.
     const bodyMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
     const cabinMat = new THREE.MeshStandardMaterial( { color: 0x000000, roughness: 0.2, metalness: 0.6 } );
-    const roofMat = new THREE.MeshStandardMaterial( { color: 0xFFCB47, roughness: 0.55, metalness: 0.15 } );
-    const bumperMat = new THREE.MeshStandardMaterial( { color: 0x1A1A1A, roughness: 0.8, metalness: 0.05 } );
     const trimMat = new THREE.MeshStandardMaterial( { color: 0x2A2A2A, roughness: 0.7, metalness: 0.1 } );
-    const grilleMat = new THREE.MeshStandardMaterial( { color: 0x111111, roughness: 0.6, metalness: 0.3 } );
-    const chromeMat = new THREE.MeshStandardMaterial( { color: 0xC8CCD0, roughness: 0.25, metalness: 0.9 } );
-    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFEEB0, emissive: 0xFFCC55, emissiveIntensity: 0.6 } );
+    const headlightMat = new THREE.MeshStandardMaterial( { color: 0xFFAA22, emissive: 0xFF9900, emissiveIntensity: 0.5 } );
     const taillightMat = new THREE.MeshStandardMaterial( { color: 0xCC1818, emissive: 0xFF2222, emissiveIntensity: 0.7 } );
-    const indicatorMat = new THREE.MeshStandardMaterial( { color: 0xFFAA22, emissive: 0xFF9900, emissiveIntensity: 0.4 } );
 
-    // Main body — lower body tub
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.55, 3.6 ), bodyMat, [ 0, - 0.2, 0 ] );
-    // Side skirts / sill trim
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 3.5 ), trimMat, [ - 0.93, - 0.42, 0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 3.5 ), trimMat, [ 0.93, - 0.42, 0 ] );
-    // Belt-line trim
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.87, 0.04, 3.55 ), trimMat, [ 0, 0.06, 0 ] );
+    // Main body — single clean elongated yellow tub
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.85, 0.7, 3.6 ), bodyMat, [ 0, - 0.05, 0 ] );
 
-    // Cabin glass (greenhouse) — taller than typical, slightly forward of center
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.6, 0.5, 1.9 ), cabinMat, [ 0, 0.35, 0.1 ] );
-    // Steel roof on top of greenhouse (lifted 3mm to avoid z-fight with cabin top)
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.62, 0.08, 1.95 ), roofMat, [ 0, 0.643, 0.1 ] );
-    // A-pillars (tilt forward slightly to suggest rake — using boxes only)
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), roofMat, [ - 0.78, 0.35, - 0.78 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.1 ), roofMat, [ 0.78, 0.35, - 0.78 ] );
-    // B-pillars
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.12 ), roofMat, [ - 0.78, 0.35, 0.2 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.08, 0.5, 0.12 ), roofMat, [ 0.78, 0.35, 0.2 ] );
-    // C-pillars (vertical hatch look)
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.1, 0.5, 0.14 ), roofMat, [ - 0.77, 0.35, 1.0 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.1, 0.5, 0.14 ), roofMat, [ 0.77, 0.35, 1.0 ] );
+    // Short bonnet bump at the front (lifted 3mm above body top to avoid z-fight)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.08, 1.0 ), bodyMat, [ 0, 0.343, - 1.25 ] );
 
-    // Bonnet (short)
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.06, 1.0 ), bodyMat, [ 0, 0.16, - 1.25 ] );
-    // Rear hatch — single solid yellow panel. No glass cutout. Depth 0.05
-    // (was 0.06) so its faces at z=[1.81, 1.86] don't coincide with the
-    // body back-face (1.80) or anything else nearby.
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.55, 0.05 ), bodyMat, [ 0, 0.15, 1.835 ] );
+    // Black cabin band on top — extends from just behind the bonnet
+    // (z≈-0.625) all the way to just shy of the body rear face (z≈1.775),
+    // so the rear reads as a proper hatchback instead of a pickup bed.
+    // Depth 2.4, center z=0.575.
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.55, 0.32, 2.4 ), cabinMat, [ 0, 0.46, 0.575 ] );
+    // Thin yellow roof skin on top of cabin (lifted 3mm to avoid z-fight)
+    _addCarMesh( parent, new THREE.BoxGeometry( 1.58, 0.05, 2.42 ), bodyMat, [ 0, 0.643, 0.575 ] );
 
-    // Front bumper (chunky plastic black)
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.28, 0.22 ), bumperMat, [ 0, - 0.32, - 1.82 ] );
-    // Rear bumper
-    _addCarMesh( parent, new THREE.BoxGeometry( 1.9, 0.28, 0.22 ), bumperMat, [ 0, - 0.32, 1.82 ] );
+    // Front headlights — small amber pair (pushed out 5mm from body front face at -1.80)
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), headlightMat, [ - 0.6, 0.05, - 1.83 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), headlightMat, [ 0.6, 0.05, - 1.83 ] );
 
-    // Grille
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.9, 0.14, 0.05 ), grilleMat, [ 0, - 0.05, - 1.83 ] );
-    // Chrome grille slats
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.85, 0.03, 0.06 ), chromeMat, [ 0, 0.0, - 1.84 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.85, 0.03, 0.06 ), chromeMat, [ 0, - 0.08, - 1.84 ] );
+    // Rear taillights — small red pair (pushed out 5mm from body rear face at 1.80)
+    _addTaillight( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), taillightMat, [ - 0.6, 0.05, 1.83 ], true );
+    _addTaillight( parent, new THREE.BoxGeometry( 0.32, 0.12, 0.06 ), taillightMat, [ 0.6, 0.05, 1.83 ], true );
 
-    // Headlight clusters (rectangular pair each side: main + indicator)
-    for ( const x of [ - 0.66, 0.66 ] ) {
+    // Side mirrors — stalk + housing each side
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), trimMat, [ - 0.86, 0.28, - 0.55 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.1, 0.08 ), bodyMat, [ - 0.95, 0.3, - 0.55 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.08 ), trimMat, [ 0.86, 0.28, - 0.55 ] );
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.14, 0.1, 0.08 ), bodyMat, [ 0.95, 0.3, - 0.55 ] );
 
-        _addCarMesh( parent, new THREE.BoxGeometry( 0.42, 0.18, 0.08 ), headlightMat, [ x, - 0.08, - 1.86 ] );
-        _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.1, 0.08 ), indicatorMat, [ x + ( x > 0 ? 0.26 : - 0.26 ), - 0.08, - 1.86 ] );
-        // Tail cluster with red + amber indicator strip
-        _addTaillight( parent, new THREE.BoxGeometry( 0.42, 0.18, 0.08 ), taillightMat, [ x, - 0.05, 1.86 ], true );
-        _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.1, 0.08 ), indicatorMat, [ x + ( x > 0 ? 0.26 : - 0.26 ), - 0.05, 1.86 ] );
-
-    }
-
-    // Side mirrors on stalks
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ - 0.86, 0.18, - 0.6 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.08 ), bodyMat, [ - 0.96, 0.2, - 0.6 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.04, 0.1 ), trimMat, [ 0.86, 0.18, - 0.6 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.18, 0.12, 0.08 ), bodyMat, [ 0.96, 0.2, - 0.6 ] );
-
-    // Door handles (one each side)
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.05, 0.18 ), chromeMat, [ - 0.94, 0.0, - 0.1 ] );
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.05, 0.18 ), chromeMat, [ 0.94, 0.0, - 0.1 ] );
-
-    // Roof antenna
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.04, 0.28, 0.04 ), trimMat, [ - 0.55, 0.82, 0.9 ] );
-
-    // Small exhaust tip
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.16, 0.1, 0.1 ), chromeMat, [ 0.55, - 0.4, 1.92 ] );
-
-    // License plate panel
-    _addCarMesh( parent, new THREE.BoxGeometry( 0.5, 0.14, 0.03 ), chromeMat, [ 0, - 0.25, 1.9 ] );
+    // Thin roof antenna
+    _addCarMesh( parent, new THREE.BoxGeometry( 0.03, 0.22, 0.03 ), trimMat, [ - 0.5, 0.78, 0.8 ] );
 
 }
 
@@ -9010,36 +9006,52 @@ function _buildGodCar( parent ) {
     _addCarMesh( parent, new THREE.BoxGeometry( 1.942, 0.08, 0.35 ), carbonMat, [ 0, - 0.463, 1.75 ] );
     for ( const sx of [ - 0.7, - 0.35, 0, 0.35, 0.7 ] ) _addCarMesh( parent, new THREE.BoxGeometry( 0.06, 0.18, 0.35 ), carbonMat, [ sx, - 0.38, 1.78 ] );
 
-    // ── NEON UNDERGLOW PAD (full chassis cyan glow) ─────────────────────────
-    // raw THREE.Mesh (no shadow tagging) so it reads as light, not a panel
-    const underglow = new THREE.Mesh( new THREE.BoxGeometry( 1.7, 0.04, 3.4 ), neonCyanMat );
+    // ── FLUID RGB UNDERGLOW + ROAD LIGHT ───────────────────────────────
+    // Each neon mesh gets per-instance material (not shared) so the
+    // per-frame hue cycler can drive each one independently. Tag with
+    // userData.godNeon + hueOffset (radians) so seam strips lag the
+    // primary glow for a flowing rainbow effect.
+    const _mkNeon = ( hueOffset, intensity ) => {
+
+        const m = new THREE.MeshStandardMaterial( { color: 0x00FFFF, emissive: 0x00FFFF, emissiveIntensity: intensity } );
+        m.userData.godNeon = true;
+        m.userData.hueOffset = hueOffset;
+        return m;
+
+    };
+    const underglow = new THREE.Mesh( new THREE.BoxGeometry( 1.7, 0.04, 3.4 ), _mkNeon( 0.0, 2.2 ) );
     underglow.position.set( 0, - 0.46, 0 );
     parent.add( underglow );
-    // Side underglow strips (a bit lower so they bleed out the sides)
-    // Lifted 3mm so their bottom face clears the underglow pad top
-    const ugL = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.04, 3.2 ), neonCyanMat );
+    const ugL = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.04, 3.2 ), _mkNeon( 0.3, 2.0 ) );
     ugL.position.set( - 0.98, - 0.417, 0 );
     parent.add( ugL );
-    const ugR = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.04, 3.2 ), neonCyanMat );
+    const ugR = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.04, 3.2 ), _mkNeon( - 0.3, 2.0 ) );
     ugR.position.set( 0.98, - 0.417, 0 );
     parent.add( ugR );
 
-    // Glowing wheel arch trims (cyan inside arch rim) — front L/R, rear L/R
-    for ( const [ x, z ] of [ [ - 0.95, - 1.05 ], [ 0.95, - 1.05 ], [ - 0.99, 1.05 ], [ 0.99, 1.05 ] ] ) {
+    for ( const [ x, z, h ] of [ [ - 0.95, - 1.05, 1.0 ], [ 0.95, - 1.05, - 1.0 ], [ - 0.99, 1.05, 1.5 ], [ 0.99, 1.05, - 1.5 ] ] ) {
 
-        const arch = new THREE.Mesh( new THREE.BoxGeometry( 0.06, 0.06, 0.95 ), neonCyanMat );
+        const arch = new THREE.Mesh( new THREE.BoxGeometry( 0.06, 0.06, 0.95 ), _mkNeon( h, 1.8 ) );
         arch.position.set( x, - 0.05, z );
         parent.add( arch );
 
     }
 
-    // Glowing body seams (magenta accent stripes along the doors)
-    const seamL = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.03, 1.8 ), neonMagentaMat );
+    const seamL = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.03, 1.8 ), _mkNeon( 2.0, 1.8 ) );
     seamL.position.set( - 0.96, 0.05, 0 );
     parent.add( seamL );
-    const seamR = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.03, 1.8 ), neonMagentaMat );
+    const seamR = new THREE.Mesh( new THREE.BoxGeometry( 0.04, 0.03, 1.8 ), _mkNeon( - 2.0, 1.8 ) );
     seamR.position.set( 0.96, 0.05, 0 );
     parent.add( seamR );
+
+    // Actual PointLight under the chassis to spill colour onto the road.
+    // Tagged so the per-frame updater knows which light to drive. Distance
+    // 4m keeps the falloff local (no lighting up trees a block away),
+    // intensity moderate so it reads as glow without blowing out the tarmac.
+    const roadLight = new THREE.PointLight( 0x00FFFF, 2.5, 4.0, 1.5 );
+    roadLight.position.set( 0, - 0.55, 0 );
+    roadLight.userData.godRoadLight = true;
+    parent.add( roadLight );
 
     // Full-width front LED light bar (white)
     _addCarMesh( parent, new THREE.BoxGeometry( 1.7, 0.04, 0.06 ), headlightMat, [ 0, - 0.08, - 1.88 ] );
@@ -10047,6 +10059,7 @@ function animate( time ) {
         updateWheels( delta );
         updateSpeedometer( speed );
         updateBrakeLights();
+        updateGodNeon( delta );
         updateRumble( speed );
         rumbleTick();
         updateDualsense( speed );
