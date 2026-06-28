@@ -14,6 +14,47 @@ import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { openRoom, generateRoomCode } from './lib/net.js';
 
+// ── console muzzle ──
+// Wallet / Web3 / inspector extensions inject contentscript code that
+// throws ReferenceErrors ("VI is not defined", "jw is not defined") and
+// floods console.warn with their internal EventEmitter / ObjectMultiplex
+// chatter. None of this is from the game; it just buries the actual
+// [ai] / [track] / [preload] logs we care about. Suppress just the noise
+// — leave everything else untouched.
+( () => {
+
+    const NOISE = [
+        /VI is not defined/,
+        /jw is not defined/,
+        /MaxListenersExceededWarning/,
+        /ObjectMultiplex/,
+        /RGBELoader has been deprecated/,
+        /THREE\.Clock: This module has been deprecated/
+    ];
+    const isNoise = ( args ) => {
+
+        const s = args && args.length ? String( args[ 0 ] ) : '';
+        for ( const re of NOISE ) if ( re.test( s ) ) return true;
+        return false;
+
+    };
+    for ( const k of [ 'warn', 'error', 'log' ] ) {
+
+        const orig = console[ k ].bind( console );
+        console[ k ] = ( ...args ) => { if ( ! isNoise( args ) ) orig( ...args ); };
+
+    }
+    // Uncaught ReferenceErrors from injected extension scripts surface as
+    // ErrorEvents on window — kill them at the source so they never reach
+    // the console.
+    window.addEventListener( 'error', ( e ) => {
+
+        if ( e && e.message && ( e.message.includes( 'VI is not defined' ) || e.message.includes( 'jw is not defined' ) ) ) e.preventDefault();
+
+    }, true );
+
+} )();
+
 let camera, scene, renderer, stats;
 let physics, physicsHelper, controls;
 let car, chassis, chassisCollider, wheels, vehicleController;
@@ -28,6 +69,12 @@ let racingLine = null;
 const ai = {
     enabled: false,
     closestIdx: 0,
+    // ±1 — which way to step through racingLine each frame. Decided at toggle
+    // time by comparing waypoint tangent vs car heading; necessary because
+    // the Hierholzer Euler circuit doesn't always emit waypoints in the
+    // direction the player spawns facing, and the offline `orientLoop` check
+    // is fooled by doubled-back sections.
+    dir: 1,
     lineMesh: null,
     badgeEl: null,
     paintedMats: new Map(),
@@ -9378,8 +9425,53 @@ async function loadRacingLine( id ) {
 
         const res = await fetch( import.meta.env.BASE_URL + 'racing-lines/' + id + '.json' );
         if ( ! res.ok ) { console.warn( `[ai] no racing-line for ${ id }` ); return; }
-        racingLine = await res.json();
-        console.log( `[ai] racing-line loaded: ${ racingLine.length } waypoints` );
+        const raw = await res.json();
+
+        // Raycast each waypoint against the loaded track. Drop waypoints
+        // whose ray either (a) misses the track entirely, or (b) hits a mesh
+        // whose material name isn't in MAPS[id].roadMaterials — i.e. it
+        // landed on grass / wall / shoulder rather than tarmac. This filters
+        // out the Hierholzer Euler-circuit detours the extractor leaves in
+        // the JSON at junctions / spawn areas.
+        const roadMats = ( MAPS[ id ] && MAPS[ id ].roadMaterials ) ? new Set( MAPS[ id ].roadMaterials ) : null;
+        const ray = new THREE.Raycaster();
+        const down = new THREE.Vector3( 0, - 1, 0 );
+        const baseY = ( typeof spawnPoint !== 'undefined' && spawnPoint ) ? spawnPoint.y : 0;
+        let onTrackCount = 0;
+        const filtered = [];
+        for ( const w of raw ) {
+
+            ray.set( new THREE.Vector3( w.x, baseY + 200, w.z ), down );
+            ray.far = 500;
+            let onTrack = false;
+            let hitY = baseY + 0.1;
+            if ( track ) {
+
+                const hits = ray.intersectObject( track, true );
+                for ( const h of hits ) {
+
+                    const matName = h.object && h.object.material && h.object.material.name;
+                    if ( ! roadMats || ( matName && roadMats.has( matName ) ) ) {
+
+                        onTrack = true;
+                        hitY = h.point.y;
+                        break;
+
+                    }
+
+                }
+
+            } else { onTrack = true; }
+            if ( onTrack ) {
+
+                onTrackCount ++;
+                filtered.push( { x: w.x, z: w.z, v: w.v, y: hitY } );
+
+            }
+
+        }
+        racingLine = filtered;
+        console.log( `[ai] racing-line loaded: ${ raw.length } raw → ${ onTrackCount } on-track waypoints (dropped ${ raw.length - onTrackCount })` );
 
     } catch ( e ) { console.warn( '[ai] racing-line fetch failed', e ); }
 
@@ -9390,10 +9482,18 @@ function toggleAiMode() {
     if ( ai.enabled ) {
 
         ai.enabled = false;
+        ai._loggedEngage = false;
         paintCarPurple( false );
         disposeAiLineMesh();
         _showAiBadge( false );
         showCarToast( 'AI off — you drive' );
+        return;
+
+    }
+
+    if ( currentMapId === 'spa' ) {
+
+        showCarToast( 'no AI on Spa — GLB road mesh is split' );
         return;
 
     }
@@ -9411,6 +9511,11 @@ function toggleAiMode() {
 
         const t = chassis.translation();
         ai.closestIdx = _aiNearestIdx( t.x, t.z, 0, racingLine.length );
+
+        // Direction handed off to aiUpdate, which dynamically re-evaluates
+        // it each frame (the racing-line JSONs are too noisy with Hierholzer
+        // U-turns to pick a single global direction reliably at engage time).
+        ai.dir = 1;
 
     }
 
@@ -9454,61 +9559,93 @@ function aiUpdate( dt ) {
     const v = chassis.linvel();
     const speed = Math.hypot( v.x, v.z );
 
-    // Incremental closest-point search — scan ~60 waypoints forward from
-    // last frame's index, plus 6 backward for the case where physics shoved
-    // us behind the line. Cheap (O(60)/frame).
     const n = racingLine.length;
-    const scanStart = ( ai.closestIdx + n - 6 ) % n;
-    ai.closestIdx = _aiNearestIdx( t.x, t.z, scanStart, 80 );
 
-    // Lookahead distance: faster → look further, so steering anticipates the
-    // line instead of chasing tail. Clamped to the range that gives stable
-    // pure-pursuit (too short = oscillation, too long = corner-cutting).
-    const lookAhead = THREE.MathUtils.clamp( 5 + speed * 0.45, 6, 28 );
-
-    // Walk forward along the loop accumulating arc length until ≥ lookAhead.
-    let walked = 0;
-    let idx = ai.closestIdx;
-    while ( walked < lookAhead ) {
-
-        const a = racingLine[ idx ];
-        const b = racingLine[ ( idx + 1 ) % n ];
-        walked += Math.hypot( b.x - a.x, b.z - a.z );
-        idx = ( idx + 1 ) % n;
-
-    }
-    const target = racingLine[ idx ];
-
-    // Express target in car-local frame so positive X = left of car, negative
-    // Z = ahead of car (Three.js convention matches the chassis's forward).
+    // Car heading in world space — used for both target selection and the
+    // pure-pursuit local-frame math.
     const q = chassis.rotation();
     _aiTmpQ.set( q.x, q.y, q.z, q.w );
     _aiFwd.set( 0, 0, - 1 ).applyQuaternion( _aiTmpQ );
     _aiRight.set( 1, 0, 0 ).applyQuaternion( _aiTmpQ );
-    const dx = target.x - t.x, dz = target.z - t.z;
-    const lx = dx * _aiRight.x + dz * _aiRight.z;
-    const lz = - ( dx * _aiFwd.x + dz * _aiFwd.z );  // > 0 when target is in front
 
-    // Steering angle from the kinematic-bicycle pure-pursuit formula:
-    // δ = atan2(2·L·sin(α), Ld) — L is wheelbase, α is angle to target,
-    // Ld is lookahead. We invert because input.steer = +1 turns left in this
-    // codebase (see updateInput / steeringCfg).
-    const alpha = Math.atan2( lx, Math.max( 0.5, lz ) );
-    const wheelbase = 2.6;
-    const delta = Math.atan2( 2 * wheelbase * Math.sin( alpha ), Math.max( 6, lookAhead ) );
-    // Map raw wheel-angle (rad) → input.steer (-1..+1). Max steer ≈ 35°.
-    let steer = THREE.MathUtils.clamp( delta / ( 35 * Math.PI / 180 ), - 1, 1 );
+    // Lookahead distance: faster → look further, so steering anticipates the
+    // line instead of chasing tail.
+    const lookAhead = THREE.MathUtils.clamp( 5 + speed * 0.45, 6, 28 );
 
-    // Speed target: smoothed over the few waypoints around the lookahead so
-    // we react to a *region*, not a single noisy sample.
-    let vSum = 0, vN = 0;
-    for ( let k = - 2; k <= 4; k ++ ) {
+    // Pick lookahead target by scanning the WHOLE racing line and picking
+    // the waypoint that is (a) in front of the car (lz > 0.5) and (b)
+    // closest to the desired lookahead distance. This sidesteps the
+    // racing-line's Hierholzer back-and-forth entirely — we don't need
+    // a loop-order direction, we just need the best ahead-waypoint.
+    // O(n) per frame (~8 k * cheap math = <0.2 ms at 60 fps).
+    const fwdX = _aiFwd.x, fwdZ = _aiFwd.z;
+    const MAX_R = 120; // m — skip waypoints further than this
+    let bestIdx = - 1, bestErr = Infinity;
+    let closestForwardD = Infinity, closestForwardIdx = - 1;
+    for ( let i = 0; i < n; i ++ ) {
 
-        const w = racingLine[ ( idx + k + n ) % n ];
-        vSum += w.v; vN ++;
+        const p = racingLine[ i ];
+        const ddx = p.x - t.x, ddz = p.z - t.z;
+        const d2 = ddx * ddx + ddz * ddz;
+        if ( d2 > MAX_R * MAX_R ) continue;
+        const lzI = ddx * fwdX + ddz * fwdZ;
+        if ( lzI < 0.5 ) continue;
+        const d = Math.sqrt( d2 );
+        const err = Math.abs( d - lookAhead );
+        if ( err < bestErr ) { bestErr = err; bestIdx = i; }
+        if ( d < closestForwardD ) { closestForwardD = d; closestForwardIdx = i; }
 
     }
-    const targetV = vSum / vN;
+    // If nothing's in front at lookAhead range, fall back to the closest
+    // forward waypoint, however close. If even THAT fails, the AI can't
+    // see the line — full brake until we get bumped back into range.
+    let idx = bestIdx >= 0 ? bestIdx : closestForwardIdx;
+    if ( idx < 0 ) {
+
+        input.steer = 0;
+        input.steerRaw = 0;
+        input.throttle = 0;
+        input.brake = 1.0;
+        input.handbrake = 0;
+        input.handbrakeAfterReset = false;
+        return;
+
+    }
+    ai.closestIdx = idx;
+    const target = racingLine[ idx ];
+    if ( ! ai._loggedEngage ) {
+
+        const tdx = target.x - t.x, tdz = target.z - t.z;
+        const tlz = tdx * fwdX + tdz * fwdZ;
+        console.log( `[ai] engage: bestIdx=${ idx }  target=(${ target.x.toFixed( 1 ) }, ${ target.z.toFixed( 1 ) })  lz=${ tlz.toFixed( 1 ) }  d=${ Math.hypot( tdx, tdz ).toFixed( 1 ) }  speed=${ speed.toFixed( 1 ) }` );
+        ai._loggedEngage = true;
+
+    }
+
+    // Express target in car-local frame:
+    //   lz = signed forward distance, POSITIVE when target is in front
+    //   lx = signed lateral offset, POSITIVE when target is to the LEFT
+    // (left-positive matches the codebase's input.steer convention where
+    //  +1 = left — see updateInput where A/← contribute +1 to kSteer.)
+    // _aiFwd / _aiRight were already populated above for the dual lookahead.
+    const dx = target.x - t.x, dz = target.z - t.z;
+    const lz = dx * _aiFwd.x + dz * _aiFwd.z;
+    const lx = - ( dx * _aiRight.x + dz * _aiRight.z );
+
+    // Pure-pursuit kinematic bicycle. atan2 keeps the angle correct in all
+    // four quadrants — if the target ends up behind (lz < 0) we get |α| > π/2
+    // and steering saturates, then the reverse-safety below brakes us so we
+    // pivot toward the line rather than plowing forward off-road.
+    const alpha = Math.atan2( lx, lz );
+    const wheelbase = 2.6;
+    const delta = Math.atan2( 2 * wheelbase * Math.sin( alpha ), Math.max( 6, lookAhead ) );
+    let steer = THREE.MathUtils.clamp( delta / ( 35 * Math.PI / 180 ), - 1, 1 );
+
+    // Speed target: just use the picked target's `v` directly. (Smoothing
+    // over neighbouring indices doesn't help when the JSON array order
+    // doesn't follow the physical loop — neighbours might be a long way
+    // around the loop physically.)
+    const targetV = target.v;
     const dv = targetV - speed;
 
     let throttle = 0, brake = 0;
@@ -9542,9 +9679,10 @@ function aiUpdate( dt ) {
 
     }
 
-    // Reverse safety: if the dot of velocity onto forward is strongly
-    // negative (we're going backwards), full brake to stop, then re-arm.
-    const vFwd = - ( v.x * _aiFwd.x + v.z * _aiFwd.z );
+    // Reverse safety: dot of velocity onto forward — positive when going
+    // forward, negative when going backward. Full brake if we've actually
+    // started rolling backward.
+    const vFwd = v.x * _aiFwd.x + v.z * _aiFwd.z;
     if ( vFwd < - 2 ) { throttle = 0; brake = 1.0; }
 
     input.steerRaw = steer;
@@ -9584,47 +9722,117 @@ function paintCarPurple( on ) {
 
 }
 
-// ─── F1-style overlay: thick line above the racing line ───
+// ─── Forza-style chevron overlay ───
+// One flat triangle arrow per Nth waypoint, instanced (single draw call),
+// rotated to point along the racing line, raycast-projected onto the track
+// so they hug elevation changes. Reads like Forza's racing-line aid /
+// F1's AR turn-by-turn arrows.
 function buildAiLineMesh() {
 
     if ( ! racingLine || ai.lineMesh ) return;
-    // Raycast straight down at each waypoint against the chunked track so the
-    // line sits ~30 cm above tarmac on hilly tracks (Spa / Nordschleife)
-    // instead of clipping through the road or floating into the sky.
-    const ray = new THREE.Raycaster();
-    const down = new THREE.Vector3( 0, - 1, 0 );
-    const pts = new Array( racingLine.length );
-    const baseY = ( typeof spawnPoint !== 'undefined' && spawnPoint ) ? spawnPoint.y : 0;
-    for ( let i = 0; i < racingLine.length; i ++ ) {
 
-        const w = racingLine[ i ];
-        ray.set( new THREE.Vector3( w.x, baseY + 200, w.z ), down );
-        ray.far = 500;
-        let y = baseY + 0.4;
-        if ( track ) {
+    // Pre-pass: walk waypoints in ai.dir direction and accept one chevron
+    // every ≥ MIN_SPACING m, skipping any candidate that's < MIN_DEDUPE m
+    // from an already-placed chevron (kills Hierholzer back-and-forth stacks
+    // that would otherwise render as overlapping fans of triangles).
+    const MIN_SPACING = 14;
+    const MIN_DEDUPE = 5;
+    const n = racingLine.length;
+    const accepted = [];
+    let cursor = ai.closestIdx || 0;
+    let acc = 0;
+    let last = racingLine[ cursor ];
+    accepted.push( cursor );
+    for ( let i = 1; i < n; i ++ ) {
 
-            const hits = ray.intersectObject( track, true );
-            if ( hits.length ) y = hits[ 0 ].point.y + 0.4;
+        const idx = ( cursor + i * ai.dir + n * 2 ) % n;
+        const p = racingLine[ idx ];
+        const dl = Math.hypot( p.x - last.x, p.z - last.z );
+        acc += dl;
+        last = p;
+        if ( acc < MIN_SPACING ) continue;
+        // Dedupe against ALL previously-placed chevrons (kills wrap-around
+        // crossings and self-intersections).
+        let tooClose = false;
+        for ( const ai_idx of accepted ) {
+
+            const ap = racingLine[ ai_idx ];
+            if ( Math.hypot( ap.x - p.x, ap.z - p.z ) < MIN_DEDUPE ) { tooClose = true; break; }
 
         }
-        pts[ i ] = new THREE.Vector3( w.x, y, w.z );
+        if ( tooClose ) continue;
+        accepted.push( idx );
+        acc = 0;
 
     }
-    // Catmull-Rom + TubeGeometry gives a smooth, fixed-width ribbon that
-    // reads cleanly in chase-cam without depending on screen-space line
-    // widths (which WebGL doesn't actually support beyond 1 px).
-    const curve = new THREE.CatmullRomCurve3( pts, true, 'catmullrom', 0.5 );
-    const tubularSegments = Math.min( 4000, racingLine.length * 2 );
-    const tube = new THREE.TubeGeometry( curve, tubularSegments, 0.6, 6, true );
+    const count = accepted.length;
+
+    // Smaller arrow: 0.7 m long × 0.9 m wide. Reads as a clear chevron from
+    // chase-cam without the huge "ramp" look the previous 1.4 m version had.
+    const arrow = new THREE.BufferGeometry();
+    arrow.setAttribute( 'position', new THREE.BufferAttribute( new Float32Array( [
+        0.0,  0.05, - 0.7,
+        - 0.45, 0.05,   0.2,
+        0.45, 0.05,   0.2
+    ] ), 3 ) );
+    arrow.setIndex( [ 0, 1, 2 ] );
+    arrow.computeVertexNormals();
+
     const mat = new THREE.MeshBasicMaterial( {
         color: ai.paintColor,
         transparent: true,
-        opacity: 0.78,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
         depthWrite: false
     } );
-    ai.lineMesh = new THREE.Mesh( tube, mat );
-    ai.lineMesh.renderOrder = 999;
-    scene.add( ai.lineMesh );
+
+    const inst = new THREE.InstancedMesh( arrow, mat, count );
+    inst.frustumCulled = false;   // bbox of the whole loop is the track itself
+    inst.renderOrder = 999;
+
+    const ray = new THREE.Raycaster();
+    const down = new THREE.Vector3( 0, - 1, 0 );
+    const baseY = ( typeof spawnPoint !== 'undefined' && spawnPoint ) ? spawnPoint.y : 0;
+    const tmpM = new THREE.Matrix4();
+    const tmpQ = new THREE.Quaternion();
+    const tmpP = new THREE.Vector3();
+    const tmpS = new THREE.Vector3( 1, 1, 1 );
+    const yAxis = new THREE.Vector3( 0, 1, 0 );
+
+    for ( let ai_i = 0; ai_i < accepted.length; ai_i ++ ) {
+
+        const idx = accepted[ ai_i ];
+        const w = racingLine[ idx ];
+        // Tangent from the NEXT accepted chevron so each arrow points at its
+        // successor (matches what the AI controller actually targets next).
+        const nextIdx = accepted[ ( ai_i + 1 ) % accepted.length ];
+        const next = racingLine[ nextIdx ];
+        const dx = next.x - w.x, dz = next.z - w.z;
+        // Arrow geometry's "forward" is -Z (Three.js convention). Yaw to
+        // align local -Z with world (dx, dz): yaw = atan2(-dx, -dz).
+        const yaw = Math.atan2( - dx, - dz );
+
+        // Snap Y to the actual track surface so the arrow follows
+        // Nordschleife's elevation changes.
+        ray.set( new THREE.Vector3( w.x, baseY + 200, w.z ), down );
+        ray.far = 500;
+        let y = baseY + 0.1;
+        if ( track ) {
+
+            const hits = ray.intersectObject( track, true );
+            if ( hits.length ) y = hits[ 0 ].point.y + 0.1;
+
+        }
+
+        tmpP.set( w.x, y, w.z );
+        tmpQ.setFromAxisAngle( yAxis, yaw );
+        tmpM.compose( tmpP, tmpQ, tmpS );
+        inst.setMatrixAt( ai_i, tmpM );
+
+    }
+    inst.instanceMatrix.needsUpdate = true;
+    scene.add( inst );
+    ai.lineMesh = inst;
 
 }
 
